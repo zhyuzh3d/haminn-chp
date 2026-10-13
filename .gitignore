@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Runtime files that live inside the package directory and carry credentials.
+# They are also excluded from the published zip by tools/package-plugin.py.
+hamdraw_chp/hamdraw_settings.json
+hamdraw_chp/chp_admin.json
+hamdraw_chp/chp_keys.json
