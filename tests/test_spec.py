@@ -111,7 +111,7 @@ os.environ["HAMDRAW_SETTINGS"] = str(_SCRATCH / "hamdraw_settings.json")
 for _name in ("HAMDRAW_PASSWORD", "HAMDRAW_TRANSLATE_URL", "HAMDRAW_TRANSLATE_MODEL"):
     os.environ.pop(_name, None)
 
-from hamdraw_chp import capabilities, families, server, settings, translate, version  # noqa: E402
+from hamdraw_chp import backends, capabilities, families, server, settings, translate, version  # noqa: E402
 
 
 def check(condition: bool, message: str) -> None:
@@ -1406,11 +1406,11 @@ def check_output_urls() -> None:
     """输出地址就是文档里公布的那条模板 —— 客户端不必自己拼。"""
     entry = {"outputs": {"9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"},
                                           {"filename": "b.jpg", "subfolder": "x", "type": "temp"}]}}}
-    files = server._outputs_of("pid", entry)
+    files = server.backend.outputs("pid", entry)
     check([item["url"] for item in files] == ["/chp/jobs/pid/output/0", "/chp/jobs/pid/output/1"],
           f"输出地址必须由 API_ROOT 拼出, 得到 {[item['url'] for item in files]}")
     check(files[1]["media_type"] == "image/jpeg", "媒体类型按扩展名判, 不信头")
-    check(server._outputs_of("pid", None) == [], "没有历史记录就是空表")
+    check(server.backend.outputs("pid", None) == [], "没有历史记录就是空表")
     check(capabilities.ENDPOINTS["output"] == "/chp/jobs/{job_id}/output/{index}", "文档里的模板")
     check(capabilities.ENDPOINTS["output"].replace("{job_id}", "pid").replace("{index}", "0")
           == files[0]["url"], "文档公布的模板与回执里的地址必须是同一条")
@@ -1427,6 +1427,22 @@ def check_server_surface() -> None:
     check(not hasattr(server, "LEGACY_ROOT"), "/hamdraw/v1 那套旧投影面已经拆掉了")
     check(not hasattr(server, "_root_of"), "_root_of 已删: 只有一个根, 没有相对谁的问题")
     check(not hasattr(server, "_size_of"), "_size_of 已删: 画幅按帧表判, 不解析数字")
+
+    # S1 · 后端抽离。这条以前只能靠 grep 查（计划 §4.1 的机械判据），现在它是断言：
+    # 谁往协议层里加回一个 ComfyUI 的 import，这里就红，而不是等某次 review 才被看见。
+    # 同一件事也守住了「两种模式是同一个协议」—— 服务模式换的是后端，不是这一层。
+    seam_source = Path(server.__file__).read_text(encoding="utf-8")
+    for token in ("folder_paths", "PromptServer", "import execution"):
+        check(token not in seam_source, f"server.py 里不该再出现 {token}")
+    check(server.backend is backends.comfy_inproc, "协议层连的就是那个 inproc 后端")
+    check(backends.BACKENDS["http"] == "comfy_http", "服务模式的后端已经在表里占好位")
+    check(backends.get("inproc") is backends.comfy_inproc, "按名字取后端")
+    try:
+        backends.get("nope")
+    except ValueError as error:
+        check(str(error) == "unknown_backend", "不认的后端名要报出来")
+    else:
+        raise AssertionError("不认的后端名应当报错, 而不是悄悄退回默认值")
 
     # 顶层只认这十个; 两个通道本身也算认得的字段
     check(server.RECOGNISED_FIELDS == frozenset({

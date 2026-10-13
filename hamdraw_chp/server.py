@@ -33,6 +33,19 @@ document's ``endpoints``, so a client that hardcoded a root is precisely the
 client this version promises nothing to.  Nothing else is served either: the
 ``/hamdraw/v1`` projections went the same way when their only consumer moved.
 
+Backends
+--------
+This module speaks CHP and nothing else: it does not import a single ComfyUI
+module.  Every question that can only be answered by the machine the models live
+on — which files are installed, what the queue holds, how a graph is validated
+and enqueued, where an output is on disk — goes through
+:mod:`hamdraw_chp.backends`, which is a module of functions with one screen of
+vocabulary.  The in-process backend is today's behaviour, moved verbatim; an
+HTTP backend is what will let ``python -m hamdraw_chp serve`` speak this same
+protocol on a machine where the plugin is not loaded.  Routes are registered
+*here*, not in the backend, because service mode attaches this same set of
+handlers to its own aiohttp app.
+
 Authentication
 --------------
 The password set in the ``HamDrawConfig`` node (or the ``HAMDRAW_PASSWORD``
@@ -97,18 +110,15 @@ import base64
 import binascii
 import hashlib
 import hmac
-import inspect
 import json
-import os
 import threading
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
-import folder_paths
 from aiohttp import web
 
+from . import backends
 from . import capabilities as capabilities_module
 from . import families
 from . import settings as settings_module
@@ -117,7 +127,11 @@ from .version import __version__
 
 API_ROOT = capabilities_module.API_ROOT
 INPUT_SUBFOLDER = "hamdraw"
-CLIENT_ID = "hamdraw"
+
+#: The one backend this process uses.  Chosen by whoever started it, never
+#: detected (§4.3 of the portal plan): the plugin gets the in-process one, and
+#: ``serve`` will ask for the HTTP one by name.
+backend = backends.get()
 
 MAX_BODY_BYTES = 32 * 1024 * 1024
 MAX_TRACKED_JOBS = 256
@@ -172,14 +186,6 @@ ERROR_MESSAGES = {
     "internal": "服务器内部错误。",
 }
 
-#: Enough to name the media type of an output without trusting a header.
-MEDIA_TYPES = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-}
-
 _JOBS: dict[str, dict[str, Any]] = {}
 #: ``request_id`` → ``{"fingerprint": …, "job_id": … | None}``。``job_id`` 为空 = 这次
 #: 提交**正在处理中**（还在翻译或校验），作业号还没生成。与 ``_JOBS`` 同一把锁：
@@ -191,14 +197,6 @@ _JOBS_LOCK = threading.RLock()
 # --------------------------------------------------------------------------- #
 # small helpers
 # --------------------------------------------------------------------------- #
-
-def _prompt_server():
-    try:
-        from server import PromptServer
-    except Exception:
-        return None
-    return getattr(PromptServer, "instance", None)
-
 
 def _json(payload: Any, status: int = 200) -> web.Response:
     return web.json_response(payload, status=status, dumps=lambda value: json.dumps(value, ensure_ascii=False))
@@ -263,13 +261,6 @@ def _authorized(request: web.Request, body: Any = None) -> bool:
 # models
 # --------------------------------------------------------------------------- #
 
-def _available_files(folder: str) -> list[str]:
-    try:
-        return [str(item) for item in folder_paths.get_filename_list(folder)]
-    except Exception:
-        return []
-
-
 def _checkpoint(category: str) -> str:
     try:
         return settings_module.checkpoint(category)
@@ -284,13 +275,35 @@ def _model_files(category: str) -> dict[str, str]:
         return {}
 
 
+def _configured_models(category: str) -> dict[str, str]:
+    """这个类别该用哪几个文件名 —— **部署事实**，运维在配置节点里写的。
+
+    机器事实（装了没装）由后端补上，见 :data:`_abilities_of`。两半分家的理由与
+    ``abilities(files_of)`` 的签名同源：一个实现可以把「有哪些模型」读成磁盘清单，
+    也可以读成上游 ``object_info`` 的枚举，但「该用哪个名字」永远只由这台机器的
+    配置决定。
+    """
+    entry = capabilities_module.CATEGORY_TABLE[str(category)]
+    roles = [str(role) for role in entry.get("roles") or []]
+    if "checkpoint" in roles:
+        return {"checkpoint": _checkpoint(str(category))}
+    return _model_files(str(category))
+
+
+#: The model-listing callable the discovery document uses, built once.  The
+#: backend answers "are they installed"; :func:`_configured_models` answers
+#: "which names did the operator write".
+_abilities_of = backend.abilities(_configured_models)
+
+
 def _accelerator(category: str) -> dict[str, Any]:
     """这台机器给这个类别配的加速档案, 已经过"那个 LoRA 到底装没装"这一关。
 
     配了却没装 ⇒ 不加速, 而且**说出来**。图里引用一个不存在的 LoRA 会让整张图校验不过
     （``invalid_workflow``）, 那是一个和"这台机器根本没配加速"完全不同的故障, 但从客户端
     看到的只有一句"工作流校验失败"。所以这里主动降级并留一行日志, 让"今天为什么慢了"
-    有据可查。清单读不出来（ComfyUI 还在启动）不算"没装" —— 那是不敢判, 见 :func:`_absent`。
+    有据可查。清单读不出来（ComfyUI 还在启动）不算"没装" —— 那是不敢判, 见
+    :func:`hamdraw_chp.backends.comfy_inproc.absent`。
     """
     try:
         profile = settings_module.accelerator(category)
@@ -299,49 +312,10 @@ def _accelerator(category: str) -> dict[str, Any]:
     lora = str(profile.get("lora") or "").strip()
     if not lora:
         return {}
-    if _absent("loras", lora):
+    if backend.absent("loras", lora):
         print(f"[hamdraw_chp] 加速 LoRA {lora} 不在 models/loras 里, {category} 这次不加速。")
         return {}
     return profile
-
-
-def _absent(folder: str, name: str) -> bool:
-    """Is this file missing, from a folder whose listing we could actually read?
-
-    An unreadable listing (ComfyUI still starting) means "cannot judge", not
-    "missing": the first is a reason to let a job through, the second a reason
-    to refuse it, and confusing them refuses work that would have run.
-    """
-    available = _available_files(folder)
-    return bool(name) and bool(available) and name not in available
-
-
-def _abilities_of(category: str) -> dict[str, Any]:
-    """One category's model files, and whether they are installed.
-
-    The shape the discovery document needs: never raises, because a document has
-    to answer even when nothing is configured, and "not ready" *is* an answer.
-    The same judgement :func:`_resolve_models` makes before queueing, so a
-    client that configures itself from this document can never be surprised by
-    ``no_model`` at submit time.
-    """
-    entry = capabilities_module.CATEGORY_TABLE[str(category)]
-    roles = [str(role) for role in entry.get("roles") or []]
-    files: dict[str, str] = {}
-    missing: list[str] = []
-    if "checkpoint" in roles:
-        name = _checkpoint(str(category))
-        files["checkpoint"] = name
-        if not name or _absent("checkpoints", name):
-            missing.append("checkpoint")
-        return {"files": files, "ready": not missing, "missing": missing}
-    stored = _model_files(str(category))
-    for role in roles:
-        name = str(stored.get(role) or "").strip()
-        files[role] = name
-        if not name or _absent(capabilities_module.ROLE_FOLDERS.get(role, ""), name):
-            missing.append(role)
-    return {"files": files, "ready": not missing, "missing": missing}
 
 
 # --------------------------------------------------------------------------- #
@@ -382,7 +356,7 @@ def _extension(raw: bytes) -> str:
 def _store_image(payload: Any, code: str) -> str:
     raw = _decode_image(payload, code)
     name = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:10]}{_extension(raw)}"
-    directory = Path(folder_paths.get_input_directory()) / INPUT_SUBFOLDER
+    directory = backend.input_directory() / INPUT_SUBFOLDER
     directory.mkdir(parents=True, exist_ok=True)
     (directory / name).write_bytes(raw)
     return f"{INPUT_SUBFOLDER}/{name}"
@@ -519,145 +493,17 @@ def _release_request(request_id: str) -> None:
             _REQUESTS.pop(request_id, None)
 
 
-def _queue_snapshot() -> tuple[list[str], list[str]]:
-    server = _prompt_server()
-    queue = getattr(server, "prompt_queue", None) if server is not None else None
-    if queue is None:
-        return [], []
-    try:
-        running, pending = queue.get_current_queue()
-    except Exception:
-        return [], []
-    return [_item_id(item) for item in running], [_item_id(item) for item in pending]
-
-
-def _item_id(item: Any) -> str:
-    try:
-        return str(item[1])
-    except (TypeError, IndexError, KeyError):
-        return ""
-
-
-def _history_entry(prompt_id: str) -> dict[str, Any] | None:
-    server = _prompt_server()
-    queue = getattr(server, "prompt_queue", None) if server is not None else None
-    if queue is None:
-        return None
-    try:
-        found = queue.get_history(prompt_id=prompt_id)
-    except Exception:
-        return None
-    if isinstance(found, dict):
-        entry = found.get(prompt_id)
-        if isinstance(entry, dict):
-            return entry
-        if found and isinstance(next(iter(found.values())), dict):
-            return next(iter(found.values()))
-    return None
-
-
-def _status_of(entry: dict[str, Any] | None) -> str:
-    if not isinstance(entry, dict):
-        return ""
-    status = entry.get("status")
-    if not isinstance(status, dict):
-        return ""
-    return str(status.get("status_str") or "")
-
-
-def _error_of(entry: dict[str, Any] | None) -> str:
-    if not isinstance(entry, dict):
-        return ""
-    status = entry.get("status")
-    messages = status.get("messages") if isinstance(status, dict) else None
-    for entry_message in messages or []:
-        if isinstance(entry_message, (list, tuple)) and len(entry_message) >= 2 and entry_message[0] == "execution_error":
-            data = entry_message[1] if isinstance(entry_message[1], dict) else {}
-            detail = str(data.get("exception_message") or data.get("exception_type") or "").strip()
-            node = str(data.get("node_type") or "").strip()
-            return f"{node}: {detail}".strip(": ") if node or detail else "execution_error"
-    return ""
-
-
-def _outputs_of(prompt_id: str, entry: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Finished images, as paths a client can fetch — never a base to re-join.
-
-    The URL is built from :data:`API_ROOT`, which is the same root
-    ``endpoints.output`` publishes, so the address a client reads out of the
-    document and the address it is handed back here are the same string.  There
-    is no second root to be relative to, so nothing here reads the request.
-    """
-    if not isinstance(entry, dict):
-        return []
-    outputs = entry.get("outputs")
-    if not isinstance(outputs, dict):
-        return []
-    files: list[dict[str, Any]] = []
-    for node_output in outputs.values():
-        if not isinstance(node_output, dict):
-            continue
-        for image in node_output.get("images") or []:
-            if not isinstance(image, dict):
-                continue
-            filename = str(image.get("filename") or "").strip()
-            if not filename:
-                continue
-            suffix = Path(filename).suffix.lower()
-            files.append(
-                {
-                    "index": len(files),
-                    "filename": filename,
-                    "subfolder": str(image.get("subfolder") or ""),
-                    "type": str(image.get("type") or "output"),
-                    "media_type": MEDIA_TYPES.get(suffix, "image/png"),
-                    "url": f"{API_ROOT}/jobs/{prompt_id}/output/{len(files)}",
-                }
-            )
-    return files
-
-
-def _state_of(job: dict[str, Any], running: list[str], pending: list[str], entry: dict[str, Any] | None) -> str:
-    if job.get("cancelled"):
-        return "cancelled"
-    outcome = _status_of(entry)
-    if outcome == "success":
-        return "completed"
-    if outcome:
-        return "failed"
-    if entry is not None:
-        return "completed"
-    job_id = job["id"]
-    if job_id in running:
-        return "running"
-    if job_id in pending:
-        return "queued"
-    return "unknown"
-
-
-def _queue_position(job_id: str, running: list[str], pending: list[str]) -> int | None:
-    """How many jobs are ahead of this one; ``0`` while it is the one running.
-
-    Unlike a percentage, this is a number every implementation can actually
-    compute, which is why the progress endpoint reports it and not an estimate.
-    """
-    if job_id in running:
-        return 0
-    if job_id in pending:
-        return pending.index(job_id)
-    return None
-
-
 def _describe(job: dict[str, Any], running: list[str], pending: list[str],
               entry: dict[str, Any] | None) -> dict[str, Any]:
-    state = _state_of(job, running, pending, entry)
+    state = backend.state_of(job, running, pending, entry)
     job_id = str(job["id"])
-    outputs = _outputs_of(job_id, entry)
+    outputs = backend.outputs(job_id, entry)
 
     payload: dict[str, Any] = {
         "id": job_id,
         "category": str(job.get("category") or ""),
         "state": state,
-        "queue_position": _queue_position(job_id, running, pending),
+        "queue_position": backend.queue_position(job_id, running, pending),
         # Never a fabricated number: the CHP contract allows null.
         "progress": None,
         "created": job.get("created"),
@@ -678,88 +524,17 @@ def _describe(job: dict[str, Any], running: list[str], pending: list[str],
         "outputs": outputs,
     }
     if state == "failed":
-        payload["error"] = _error_of(entry) or "execution_error"
+        payload["error"] = backend.error_of(entry) or "execution_error"
     return payload
 
 
 def _progress_payload(job_id: str, job: dict[str, Any] | None, entry: dict[str, Any] | None,
                       running: list[str], pending: list[str]) -> dict[str, Any]:
     """The light polling answer: state and position, never output parsing."""
-    state = "unknown"
-    if job is not None:
-        state = _state_of(job, running, pending, entry)
-    elif entry is not None:
-        state = "completed" if not _status_of(entry) or _status_of(entry) == "success" else "failed"
-    elif job_id in running:
-        state = "running"
-    elif job_id in pending:
-        state = "queued"
-    return {"id": job_id, "state": state,
-            "queue_position": _queue_position(job_id, running, pending),
+    return {"id": job_id,
+            "state": backend.progress_state(job_id, job, entry, running, pending),
+            "queue_position": backend.queue_position(job_id, running, pending),
             "progress": None}
-
-
-def _safe_output_path(kind: str, subfolder: str, filename: str) -> Path | None:
-    roots = {
-        "output": getattr(folder_paths, "get_output_directory", None),
-        "temp": getattr(folder_paths, "get_temp_directory", None),
-        "input": getattr(folder_paths, "get_input_directory", None),
-    }
-    getter = roots.get(kind) or roots["output"]
-    if getter is None:
-        return None
-    try:
-        root = Path(getter()).resolve()
-    except Exception:
-        return None
-    parts = [part for part in str(subfolder or "").replace("\\", "/").split("/") if part not in ("", ".")]
-    if any(part == ".." for part in parts):
-        return None
-    candidate = root.joinpath(*parts, str(filename or "").strip()).resolve()
-    try:
-        if os.path.commonpath([str(root), str(candidate)]) != str(root):
-            return None
-    except ValueError:
-        return None
-    return candidate if candidate.is_file() else None
-
-
-async def _maybe_await(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return await value
-    return value
-
-
-async def _drop_pending(job_id: str) -> bool:
-    server = _prompt_server()
-    queue = getattr(server, "prompt_queue", None) if server is not None else None
-    if queue is None:
-        return False
-    remover = getattr(queue, "delete_queue_item", None)
-    if not callable(remover):
-        return False
-    try:
-        return bool(await _maybe_await(remover(lambda item: _item_id(item) == job_id)))
-    except Exception:
-        return False
-
-
-async def _interrupt_running() -> bool:
-    server = _prompt_server()
-    queue = getattr(server, "prompt_queue", None) if server is not None else None
-    for owner in (queue, server):
-        if owner is None:
-            continue
-        for name in ("interrupt_current_processing", "interrupt_processing"):
-            action = getattr(owner, name, None)
-            if not callable(action):
-                continue
-            try:
-                await _maybe_await(action())
-                return True
-            except Exception:
-                continue
-    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -802,7 +577,7 @@ def _no_model(category: str, folder: str, name: str = "") -> web.Response:
         message = f"这个场景还没有在 {folder} 里选模型。"
     return _fail("no_model", message=message,
                  detail={"category": category, "folder": folder,
-                         "available": _available_files(folder)})
+                         "available": backend.available(folder)})
 
 
 def _resolve_models(category: str) -> tuple[dict[str, str], web.Response | None]:
@@ -857,9 +632,9 @@ async def create_job(request: web.Request) -> web.Response:
         if decision == "replay":
             # 重放答的是**同一个作业的此刻**，不是第一次那个 202 的复印件：客户端
             # 之所以重发，正因为上次没收到回音，而那张图很可能早就好了。
-            running, pending = _queue_snapshot()
+            running, pending = backend.queue()
             return _json({"job": _describe(subject, running, pending,
-                                          _history_entry(str(subject["id"]))),
+                                          backend.history(str(subject["id"]))),
                           "replayed": True}, status=202)
 
     try:
@@ -922,7 +697,7 @@ async def create_job(request: web.Request) -> web.Response:
         if refused is not None:
             return refused
 
-        running, pending = _queue_snapshot()
+        running, pending = backend.queue()
         if len(pending) >= MAX_PENDING_JOBS:
             return _fail("busy", detail={"pending": len(pending)})
 
@@ -981,39 +756,13 @@ async def create_job(request: web.Request) -> web.Response:
         except Exception:
             return _fail("internal", "内置工作流生成失败。")
 
-        server = _prompt_server()
-        if server is None:
-            return _fail("internal", "ComfyUI 服务未就绪。")
-
-        prompt_id = str(uuid.uuid4())
+        # 校验与入队都在后端: 它们要摸的对象（那个正在跑的 ComfyUI）只有后端认得。
+        # ``invalid_workflow`` 那句里带着 ComfyUI 自己的话 —— 那是"哪个节点、为什么"
+        # 唯一存在的地方, 所以原样带出来, 不压成一句 ``internal``。
         try:
-            import execution
-
-            valid = await execution.validate_prompt(prompt_id, graph, ["9"])
-        except Exception:
-            return _fail("internal", "工作流校验无法执行。")
-
-        if not valid or not valid[0]:
-            reasons = valid[1] if valid and len(valid) > 1 else ""
-            node_errors = valid[3] if valid and len(valid) > 3 else None
-            text = reasons if isinstance(reasons, str) else json.dumps(reasons, ensure_ascii=False)
-            return _fail("invalid_workflow", text or ERROR_MESSAGES["invalid_workflow"], detail={"node_errors": node_errors})
-
-        outputs_to_execute = valid[2]
-        queue = getattr(server, "prompt_queue", None)
-        if queue is None:
-            return _fail("internal", "ComfyUI 队列不可用。")
-
-        try:
-            number = int(getattr(server, "number", 0))
-            server.number = number + 1
-        except Exception:
-            number = 0
-        extra_data = {"client_id": CLIENT_ID, "create_time": int(time.time() * 1000)}
-        try:
-            queue.put((number, prompt_id, graph, extra_data, outputs_to_execute, {}))
-        except Exception:
-            return _fail("internal", "任务入队失败。")
+            prompt_id = await backend.submit(graph)
+        except backends.BackendUnavailable as error:
+            return _fail(error.code, error.message, detail=error.detail)
 
         job = {
             "id": prompt_id,
@@ -1046,7 +795,7 @@ async def job_status(request: web.Request) -> web.Response:
         return _fail("unauthorized")
     job_id = str(request.match_info.get("job_id") or "").strip()
     job = _tracked(job_id)
-    entry = _history_entry(job_id)
+    entry = backend.history(job_id)
     if job is None:
         if entry is None:
             return _fail("not_found")
@@ -1054,7 +803,7 @@ async def job_status(request: web.Request) -> web.Response:
         # ComfyUI's history still has the outputs, so the job is described from
         # an empty shell rather than reported missing.
         job = {"id": job_id, "category": "", "created": time.time(), "cancelled": False}
-    running, pending = _queue_snapshot()
+    running, pending = backend.queue()
     return _json({"job": _describe(job, running, pending, entry)})
 
 
@@ -1071,8 +820,8 @@ async def job_progress(request: web.Request) -> web.Response:
         return _fail("unauthorized")
     job_id = str(request.match_info.get("job_id") or "").strip()
     job = _tracked(job_id)
-    entry = _history_entry(job_id)
-    running, pending = _queue_snapshot()
+    entry = backend.history(job_id)
+    running, pending = backend.queue()
     if job is None and entry is None and job_id not in running and job_id not in pending:
         return _fail("not_found")
     return _json({"job": _progress_payload(job_id, job, entry, running, pending)})
@@ -1086,11 +835,11 @@ async def job_output(request: web.Request) -> web.Response:
         index = int(str(request.match_info.get("index") or "0"))
     except (TypeError, ValueError):
         return _fail("bad_request")
-    files = _outputs_of(job_id, _history_entry(job_id))
+    files = backend.outputs(job_id, backend.history(job_id))
     if index < 0 or index >= len(files):
         return _fail("not_found")
     chosen = files[index]
-    path = _safe_output_path(chosen["type"], chosen["subfolder"], chosen["filename"])
+    path = backend.output_path(chosen["type"], chosen["subfolder"], chosen["filename"])
     if path is None:
         return _fail("not_found")
     response = web.FileResponse(path)
@@ -1104,14 +853,10 @@ async def cancel_job(request: web.Request) -> web.Response:
         return _fail("unauthorized")
     job_id = str(request.match_info.get("job_id") or "").strip()
     job = _tracked(job_id)
-    running, pending = _queue_snapshot()
+    running, pending = backend.queue()
     if job is None and job_id not in running and job_id not in pending:
         return _fail("not_found")
-    dropped = False
-    if job_id in pending:
-        dropped = await _drop_pending(job_id)
-    elif job_id in running:
-        dropped = await _interrupt_running()
+    dropped = await backend.cancel(job_id, running, pending)
     if job is not None:
         job["cancelled"] = True
     elif dropped:
@@ -1119,8 +864,8 @@ async def cancel_job(request: web.Request) -> web.Response:
         _track(job)
     if job is None:
         return _fail("not_found")
-    running, pending = _queue_snapshot()
-    return _json({"job": _describe(job, running, pending, _history_entry(job_id))})
+    running, pending = backend.queue()
+    return _json({"job": _describe(job, running, pending, backend.history(job_id))})
 
 
 async def translate_prompts(request: web.Request) -> web.Response:
@@ -1152,20 +897,19 @@ async def translate_prompts(request: web.Request) -> web.Response:
 # wiring
 # --------------------------------------------------------------------------- #
 
-def register_routes() -> bool:
-    """Attach the API to the running ComfyUI server; safe to call once at import."""
-    server = _prompt_server()
-    if server is None:
-        return False
-    routes = getattr(server, "routes", None)
+def register_routes(routes: Any = None) -> bool:
+    """Attach the API to a running server; safe to call once at import.
+
+    ``routes`` may be handed in — service mode passes its own aiohttp app's table
+    — and when it is not, it is asked of the backend, which answers ``None``
+    outside ComfyUI.  ``False`` therefore means "there is nowhere to attach yet",
+    not "this failed"; the caller decides whether that is worth a log line.
+    """
+    if routes is None:
+        routes = backend.routes()
     if routes is None:
         return False
-    application = getattr(server, "app", None)
-    if application is not None:
-        try:
-            application._client_max_size = MAX_BODY_BYTES
-        except Exception:
-            pass
+    backend.limit_body(MAX_BODY_BYTES)
 
     # One root, spelled once.  The alias loop that used to be here existed so
     # ``/cvp`` could serve the same API; a client is now told to read its
