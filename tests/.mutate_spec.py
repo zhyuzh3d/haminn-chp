@@ -19,6 +19,9 @@ SERVER = "hamdraw_chp/server.py"
 SETTINGS = "hamdraw_chp/settings.py"
 FAMILIES = "hamdraw_chp/families/__init__.py"
 QWEN = "hamdraw_chp/families/qwen_image.py"
+#: S1 之后「输出地址由谁拼」这条判据住在后端里 —— 变异必须跟着它走，否则锚点
+#: 找不到就静默 SKIP，而 SKIP 与 CAUGHT 在退出码上看不出区别。
+INPROC = "hamdraw_chp/backends/comfy_inproc.py"
 
 #: 变异会把某一处改坏, 而"改坏"的一种样子就是让某条路径变成死等。没有上限的话
 #: 一次死等就把整个脚本拖住, 读的人分不清"它在跑"和"它卡住了"。
@@ -227,7 +230,7 @@ MUTATIONS = [
         # 与"这台机器根本没配加速"长得一模一样，而这两件事的修法完全不同。
         "配了却没装的 LoRA 照样往图里写",
         SERVER,
-        '    if _absent("loras", lora):',
+        '    if backend.absent("loras", lora):',
         '    if False:',
         "LoRA 不在 models/loras 里就不许往图里写",
     ),
@@ -279,8 +282,8 @@ MUTATIONS = [
     ),
     (
         "输出地址不再由 API_ROOT 拼（客户端拿到的路径和文档公布的不是同一条）",
-        SERVER,
-        '"url": f"{API_ROOT}/jobs/{prompt_id}/output/{len(files)}",',
+        INPROC,
+        '"url": f"{capabilities_module.API_ROOT}/jobs/{prompt_id}/output/{len(files)}",',
         '"url": f"/cvp/jobs/{prompt_id}/output/{len(files)}",',
         "输出地址必须由 API_ROOT 拼出",
     ),
@@ -318,7 +321,7 @@ MUTATIONS = [
         "重放照抄第一次那份（不读此刻的状态）",
         SERVER,
         '            return _json({"job": _describe(subject, running, pending,\n'
-        '                                          _history_entry(str(subject["id"]))),\n'
+        '                                          backend.history(str(subject["id"]))),\n'
         '                          "replayed": True}, status=202)',
         '            return _json({"job": _describe(subject, running, pending, None),\n'
         '                          "replayed": True}, status=202)',
@@ -384,6 +387,16 @@ MUTATIONS = [
         '                      "replayed": False}, status=202)',
         '                      }, status=202)',
         "应答里每次都要带 replayed",
+    ),
+    # --- S1 · 后端抽离 ---------------------------------------------------- #
+    # 这条判据（计划 §4.1）本来只能靠一条 grep 查，现在它也是断言。变异就是"让耦合
+    # 长回来"—— 一个多余的 import 就足够，不用真的调用它。
+    (
+        "ComfyUI 的耦合又长回协议层",
+        SERVER,
+        'from . import backends\n',
+        'import folder_paths  # mutation probe\nfrom . import backends\n',
+        "server.py 里不该再出现 folder_paths",
     ),
 ]
 
