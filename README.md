@@ -1,6 +1,6 @@
-# CHP 插件 — ComfyUI Haminn Protocol
+# CHP 插件（CHPCP）— Haminn 综合入口程序的 ComfyUI 后端
 
-CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，名字叫 `hamdraw_chp`。
+CHP 是 **Consolidated Haminn Portal**（中文「Haminn 综合入口程序」）；这个目录是它的**参考实现**，装在 ComfyUI 里，名字叫 `hamdraw_chp`（这一半自称 **CHP 插件**，简称 **CHPCP**）。
 
 任何客户端（HamDraw 本体、其他开发者的工具、只会发 curl 的脚本）只要认下面这一个 HTTP 契约，就能用你已经装好的 ComfyUI 出图，**不需要自己导出工作流 JSON** —— 五个场景的图都内置在插件里。
 
@@ -11,7 +11,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 - 契约文本：[`plans/chp-spec.md`](../plans/chp-spec.md)；落地计划：[`plans/chp-v2-plan.md`](../plans/chp-v2-plan.md)
 - 目录：把 `hamdraw_chp/` 整个放进 ComfyUI 的 `custom_nodes/`
 
-**新客户端第一步先调信息接口**（公开，不要密码）：它一次给出这台机器上**有哪些场景、每个场景收什么请求体、背后是哪几个模型文件、每个场景能出哪些画幅、这条场景的编码器认不认中文、有没有语音能力（有哪些音色）、以及你带的密码对不对**。
+**新客户端第一步先调信息接口**（**要钥匙** —— 前提是配了至少一把；一把都没配的部署是公开的，见「安装」第 4 步）：它一次给出这台机器上**有哪些场景、每个场景收什么请求体、背后是哪几个模型文件、每个场景能出哪些画幅、这条场景的编码器认不认中文、有没有语音能力（有哪些音色）**，以及**这把钥匙能用到的部分** —— 没带或带错就是 `401`，不再靠 `auth.authorized` 那一句「你带的密码不对」。
 
 ## 安装
 
@@ -44,7 +44,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
    **一把钥匙都没配时（配置节点的密码为空、且没有 key 表）服务是公开的**，`/chp/info` 照旧 `200` 并给出全部能力 —— 这是既有行为，老用户零改动。
 
-   **插件版本只有一个出处**：`hamdraw_chp/version.py` 的 `__version__`。发布包名（`tools/package-plugin.py`）与 App 内嵌副本（`tools/embed-plugin.py`）都读它，不会各自漂移。
+   **插件版本只有一个出处**：`hamdraw_chp/version.py` 的 `__version__`。发布包名由 `tools/package-plugin.py` 从它派生（`release/hamdraw-comfyui-plugin-v<ver>.zip`），`/chp/info` 上报的 `plugin.version` 也是它 —— 两个数字同源。**happ 里不再有内嵌副本**（2026-10-13 起 CHP 从三个 happ 里彻底分离，插件只从官网取），所以这条版本线从此只属于本仓。
 
 ## 配置（HamDraw 配置节点）
 
@@ -197,7 +197,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 改完**下一个请求就生效**（每次请求重读），不用重启。`categories` 写成空数组是一把**什么都看不见、也什么都做不了**的钥匙 —— 那正是"撤权但先不删"的写法，而不是"全部"。
 
-**密码和 key 用什么字符都行，含中文** —— 比对按 UTF-8 字节做。这条有来由：`hmac.compare_digest` 喂它一个含非 ASCII 的 `str` 会直接抛异常，而"密码里有个「中」字"对运维是再普通不过的一件事 —— 坏起来不是拒收，是**整条请求 500**。
+**密码和 key 只认英文大小写字母、数字、`-` 和 `_`**（业主 2026-10-13 定，**中文不必支持**）。这条规矩卡在**收进来那一刻**，两个收口：控制台建 key、配置节点那格密码（Queue 那一次会被挡下来并说清原因）。不在比对时替非 ASCII 绕路 —— `hmac.compare_digest` 遇到非 ASCII 的 `str` 会直接抛，所以那种"支持"以前是拿一条 500 换来的。**送上来的**那一串不受这条规矩管：不匹配就是一句 `401`（比对照旧按字节走，所以一个中文的尝试不会变成 500）。`chp_admin.json` 是运维自己写的文件、**读它的时候不拦**（拦了就是把自己锁在门外）。
 
 ## 提交作业（`jobs`）
 
@@ -265,7 +265,9 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 `job` 对象里三个字段回答“提示词到底发生了什么”：`prompt_source` 是客户端给的原文、`prompt` 是实际送进模型的那份、`translated` 表示两者是否不同。
 
-错误码：`unauthorized(401)` / `bad_request` / `unsupported_category` / `unsupported_size` / `unsupported_steps` / `bad_image` / `bad_mask` / `stretched_reference` / `invalid_workflow` / `unsupported_voice(400)` / `forbidden_capability(403)` / `no_model(409)` / `no_engine(409)` / `speech_failed(502)` / `busy(429)` / `duplicate_request(409)` / `not_found(404)` / `internal(500)`，全部带可读中文文案。`/chp/info` 的 `errors` 就是这份清单，所以客户端不必自己抄一遍。**其中只有 `unauthorized` 的响应体多一个 `spec`**（客户端靠它把「是 CHP、只是钥匙不对」和「那里没有插件」分开），其余错误码的形状一个字节都没变。
+错误码：`unauthorized(401)` / `bad_request` / `unsupported_category` / `unsupported_size` / `unsupported_steps` / `bad_image` / `bad_mask` / `stretched_reference` / `invalid_workflow` / `unsupported_voice(400)` / `forbidden_capability(403)` / `no_model(409)` / `no_upstream(409)` / `no_engine(409)` / `speech_failed(502)` / `busy(429)` / `duplicate_request(409)` / `not_found(404)` / `internal(500)`，全部带可读中文文案。`/chp/info` 的 `errors` 就是这份清单，所以客户端不必自己抄一遍。**其中只有 `unauthorized` 的响应体多一个 `spec`**（客户端靠它把「是 CHP、只是钥匙不对」和「那里没有插件」分开），其余错误码的形状一个字节都没变。
+
+`no_upstream` 只在**服务模式**（`python -m hamdraw_chp serve`，见下）里回：那种模式自己不跑模型，所以"上游那台 ComfyUI 连不上"是一件真会发生的事。它与 `no_model` 分得很清楚，因为两件事要人做的是**两件不同的事**：一个是去那台机器上看它为何没在跑，另一个是回到配置节点上挑模型。
 
 ### `/cvp` 与 `/hamdraw/v1` 都不存在了
 
@@ -409,7 +411,37 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 `categories` 写 `["*"]` 是"全部"，写空数组是"什么都看不见、也什么都做不了"（撤权但先不删的写法）。**key 明文存储**、表按 `0600` 原子写：它就是一把可以抄出来交给别人的钥匙，而管理员需要能把它复制走。
 
+**key 与密码只认英文大小写字母、数字、`-` 和 `_`**（不支持中文）—— 这条规矩卡在**收进来的那一刻**：控制台拒收别的写法，配置节点（默认钥匙）也一样，Queue 那一次会被挡下来并说清原因。`chp_admin.json` 的控制台凭据是运维自己写的文件，读它的时候不拦（拦了就是把自己锁在门外）；**送上来的**那一串更不受限制，只是不匹配就照旧一句 `401`（凭据比对按字节走，所以一个中文的尝试不会变成 500）。
+
 三个配置文件都**不在版本库里**（`.gitignore`），也都**不会进发布 zip**（`tools/package-plugin.py` 按名字排除，且发现它们在树里会打一行警告）：发布包该装到谁的机器上，谁的机器上就还没有这些凭据。
+
+## 服务模式（`python -m hamdraw_chp serve`）
+
+**一个包，两个入口**：`import hamdraw_chp` 是**插件**（进程内后端，跑在 ComfyUI 自己的端口上）；`python -m hamdraw_chp serve` 是**服务**（HTTP 后端，自己起一个端口）。**模式由「谁启动的」决定，不自动检测。**
+
+上面写的每一个接口、每一个错误码、`/chp/info` 的每一个字段，两种模式下**完全一样** —— 客户端无从分辨，也不需要分辨。
+
+```bash
+python -m hamdraw_chp serve          # 默认 127.0.0.1:8889
+```
+
+`hamdraw_settings.json` 的 `serve` 块（**插件模式忽略这一档**：绑定由 ComfyUI 决定）：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `serve.host` | `127.0.0.1` | 绑定地址 |
+| `serve.port` | `8889` | 自己的端口；**换它不用改客户端、不用改文档** |
+| `serve.upstream` | `http://127.0.0.1:8188` | 上游 ComfyUI 的地址；**只在部署侧配，永不来自请求体** |
+
+服务模式怎么拿到上游的东西：**模型清单**来自上游 `object_info` 的枚举，读的是一份**快照**（所以 `/chp/info` 永远不等上游、上游慢也不拖它）；**作业号**由本服务自己发，`我们的号 ↔ 上游 prompt_id` 的映射在内存里（进程重启前提交的作业只能回 `not_found`，与「从来不存在的号」同一个答案）；**参考图**先落本机暂存目录，提交时上传、并按**上游答的那个名字**改写图里那一格；**产物**反向取回再交给 `FileResponse`。**不假设与上游共享文件系统** —— 假设共享是那种「本机测得通、换台机器就废」的设计。
+
+**上游不在时**：`/chp/info` 仍返回 **200**，`abilities` 全部 `ready: false`、`errors` 里写 `no_upstream`（409）。「后端缺席 ≠ 服务缺席」；把它说成 `no_model` 会把人指到错的配置文件上。
+
+验收就三条，一条比一条硬：
+
+1. 同一个 key 下 `/chp/info` 与插件模式**逐字节相同**（`endpoints` 存的是相对路径，所以连地址都不必例外）；
+2. 上游不在时 `/chp/info` 仍 200 且 `errors` 里有说明；
+3. 改 `serve.port` 后客户端**一行不改**仍可用。
 
 ## 自测
 
@@ -456,4 +488,4 @@ curl -s -u hamster:imahamster http://<host>:8188/chp/admin/keys
 第 4 / 5 步看响应头：`Content-Type` 分别是 `audio/pcm` 与 `audio/wav`，两者都带 `X-Sample-Rate`。播第 5 步那个文件最简单（`afplay speech.wav` / 双击）；第 4 步那份是裸 PCM，播放器要知道参数：`24000 Hz`、单声道、`s16le`。
 
 - **第一次请求会慢**（模型加载，约十几秒），之后同模型重跑约 1 秒；别用首单判断“模型太慢”。
-- 在 HamDraw App 里对接：设置 → 模型配置 → 接口模式选「CHP 插件（ComfyUI Haminn Protocol）」，服务器地址填 `http://<host>:<port>`，访问密码填节点里设的那个。
+- 在 HamDraw App 里对接：设置 → 模型配置 → 接口模式选「CHP 插件（CHPCP）」，服务器地址填 `http://<host>:<port>`，访问密码填节点里设的那个。

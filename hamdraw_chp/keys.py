@@ -19,6 +19,10 @@ Keys are stored in clear text on purpose.  The file sits on the machine that
 already holds the engine token and the model files, and an administrator has to be
 able to copy a key out to hand it to somebody.  Mode 0600.
 
+**A credential is letters, digits, ``-`` and ``_``** (:data:`ALPHABET`) — a rule
+enforced where one is *taken in* (the console, the config node) rather than
+apologised for at every comparison.
+
 **An absent or unreadable file means "no keys from the table" — never "allow
 everything".** Whether the deployment is public is decided elsewhere: it is public
 only while *nothing at all* is configured (no default key and no table entry), and
@@ -31,6 +35,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +56,18 @@ FILENAME = "chp_keys.json"
 #: revokes a key without deleting it (the key still opens the door, and what is
 #: behind the door is nothing).
 ALL = "*"
+
+#: **密码与 key 认得的全部字符：英文大小写字母、数字、``-`` 与 ``_``**（业主 2026-10-13 定）。
+#: 中文不必支持，所以它不是"要小心绕开的一种输入"，而是一条**当场拒收**的规矩 ——
+#: 与其在比较函数里为非 ASCII 留一条分支（``hmac.compare_digest`` 遇到它会抛，那曾
+#: 是一条 500），不如让它根本存不进来。``secrets.token_urlsafe`` 生成的正好落在这个
+#: 字母表里，所以"换一把"不用改。
+ALPHABET = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def spelling_ok(value: Any) -> bool:
+    """Is this a credential CHP accepts?  空串不算：空 key 是"没给"，不是"给了空的"。"""
+    return ALPHABET.fullmatch(str(value or "")) is not None
 
 
 def path() -> Path:
@@ -82,13 +99,14 @@ def read() -> list[dict[str, Any]]:
 
 
 def matches(token: str, key: str) -> bool:
-    """Constant-time equality that survives non-ASCII — the one place it is decided.
+    """Constant-time equality — the one place in CHP a credential is compared.
 
-    ``hmac.compare_digest`` raises ``TypeError: comparing strings with non-ASCII
-    characters is not supported`` the moment either side is a ``str`` holding a
-    non-ASCII character, and "the password has a 中 in it" is an entirely ordinary
-    thing for an operator to set up.  Encoding both sides to UTF-8 first keeps the
-    comparison constant-time **and** turns that from a 500 into an ordinary yes/no.
+    Compared as **UTF-8 bytes**, and that is now belt-and-braces rather than
+    accommodation: everything *stored* is ASCII by rule (:data:`ALPHABET`), but
+    the token that arrives is whatever somebody typed.  ``hmac.compare_digest``
+    raises ``TypeError`` on a ``str`` holding a non-ASCII character, so a client
+    who sends 中文 would get a **500** instead of a plain "no" — and a wrong
+    credential is an ordinary answer, not an engine fault.
 
     Every comparison in CHP goes through here on purpose: the same defect lived in
     two places (the default key and this table), and one of them being right while
@@ -164,5 +182,5 @@ def label_of(record: dict[str, Any] | None) -> str:
     return str(record.get("label") or record.get("id") or record.get("source") or "").strip()
 
 
-__all__ = ["ALL", "ENVIRONMENT_FILE", "FILENAME", "SCHEMA", "allowed_of", "label_of",
-           "matches", "path", "permits", "read", "resolve"]
+__all__ = ["ALPHABET", "ALL", "ENVIRONMENT_FILE", "FILENAME", "SCHEMA", "allowed_of",
+           "label_of", "matches", "path", "permits", "read", "resolve", "spelling_ok"]

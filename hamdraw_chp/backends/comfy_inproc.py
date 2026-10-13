@@ -8,6 +8,13 @@ has to be able to answer these same questions about a ComfyUI that lives on
 another machine (see ``comfy_http``), and it cannot do that while the answers are
 spelled in terms of ``PromptServer.instance``.
 
+**What is left here is only what differs from the HTTP backend.**  The answers
+that must come out identical in both modes — job state, progress, queue position,
+the outputs of a history entry, one category's resolved model files — live in
+:mod:`hamdraw_chp.backends.records` and are imported below, because "two modes,
+one protocol" is a claim about those answers and duplicating them would make it
+untrue the first time one copy changed.
+
 Three judgements moved with the code, because they are judgements and not
 mechanics:
 
@@ -18,6 +25,12 @@ mechanics:
   sentence attached**, because that is the only place the reason exists.  It is
   deliberately not flattened into ``internal``: "节点名: 原因" is what lets an
   operator see that a model file is missing.
+
+**The three questions the upstream has to be asked are ``async``**, even though
+this backend answers them without awaiting anything: ``queue()``, ``history()``
+and ``output_path()`` are I/O in service mode, so their shape is I/O here too.
+A difference in shape would be a difference the protocol layer has to know about,
+which is exactly what this seam exists to prevent.
 """
 
 from __future__ import annotations
@@ -34,18 +47,13 @@ import folder_paths
 
 from .. import capabilities as capabilities_module
 from . import BackendUnavailable
+from .records import MEDIA_TYPES, error_of, outputs, progress_state, prompt_id_of  # noqa: F401
+from .records import queue_position, resolve_category, state_of, status_of  # noqa: F401
 
 #: Sent as ``client_id`` on every queued prompt.  One name, because this plugin
 #: is one client; ComfyUI's own UI uses it to tell whose job is running.
 CLIENT_ID = "hamdraw"
 
-#: Enough to name the media type of an output without trusting a header.
-MEDIA_TYPES = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-}
 
 
 # --------------------------------------------------------------------------- #
@@ -129,19 +137,12 @@ def abilities(files_of: Any) -> Any:
     makes before queueing, deliberately shared — a client that configures itself
     from this document can then never be surprised by ``no_model`` at submit
     time, which is the one failure mode a discovery document exists to prevent.
+
+    The body is :func:`records.resolve_category` plus this machine's own
+    :func:`absent` — the single line where the two modes are allowed to differ.
     """
     def resolve(category: str) -> dict[str, Any]:
-        entry = capabilities_module.CATEGORY_TABLE[str(category)]
-        roles = [str(role) for role in entry.get("roles") or []]
-        configured = files_of(str(category)) or {}
-        files: dict[str, str] = {}
-        missing: list[str] = []
-        for role in roles:
-            name = str(configured.get(role) or "").strip()
-            files[role] = name
-            if not name or absent(capabilities_module.ROLE_FOLDERS.get(role, ""), name):
-                missing.append(role)
-        return {"files": files, "ready": not missing, "missing": missing}
+        return resolve_category(category, files_of(str(category)), absent)
 
     return resolve
 
@@ -150,7 +151,13 @@ def abilities(files_of: Any) -> Any:
 # the queue and its history
 # --------------------------------------------------------------------------- #
 
-def queue() -> tuple[list[str], list[str]]:
+async def queue() -> tuple[list[str], list[str]]:
+    """``(running, pending)`` — prompt ids, because here the job *is* the prompt.
+
+    ``async`` although nothing is awaited: over HTTP the same question is a
+    ``GET``, and a vocabulary whose shape changes with the backend would leak the
+    backend into the protocol layer (see the module docstring).
+    """
     instance = server()
     prompt_queue = getattr(instance, "prompt_queue", None) if instance is not None else None
     if prompt_queue is None:
@@ -159,17 +166,10 @@ def queue() -> tuple[list[str], list[str]]:
         running, pending = prompt_queue.get_current_queue()
     except Exception:
         return [], []
-    return [_item_id(item) for item in running], [_item_id(item) for item in pending]
+    return [prompt_id_of(item) for item in running], [prompt_id_of(item) for item in pending]
 
 
-def _item_id(item: Any) -> str:
-    try:
-        return str(item[1])
-    except (TypeError, IndexError, KeyError):
-        return ""
-
-
-def history(prompt_id: str) -> dict[str, Any] | None:
+async def history(prompt_id: str) -> dict[str, Any] | None:
     instance = server()
     prompt_queue = getattr(instance, "prompt_queue", None) if instance is not None else None
     if prompt_queue is None:
@@ -187,129 +187,19 @@ def history(prompt_id: str) -> dict[str, Any] | None:
     return None
 
 
-def status_of(entry: dict[str, Any] | None) -> str:
-    if not isinstance(entry, dict):
-        return ""
-    status = entry.get("status")
-    if not isinstance(status, dict):
-        return ""
-    return str(status.get("status_str") or "")
-
-
-def error_of(entry: dict[str, Any] | None) -> str:
-    if not isinstance(entry, dict):
-        return ""
-    status = entry.get("status")
-    messages = status.get("messages") if isinstance(status, dict) else None
-    for entry_message in messages or []:
-        if isinstance(entry_message, (list, tuple)) and len(entry_message) >= 2 and entry_message[0] == "execution_error":
-            data = entry_message[1] if isinstance(entry_message[1], dict) else {}
-            detail = str(data.get("exception_message") or data.get("exception_type") or "").strip()
-            node = str(data.get("node_type") or "").strip()
-            return f"{node}: {detail}".strip(": ") if node or detail else "execution_error"
-    return ""
-
-
-def state_of(job: dict[str, Any], running: list[str], pending: list[str],
-             entry: dict[str, Any] | None) -> str:
-    """The full status call's state — the one that reads the history entry first."""
-    if job.get("cancelled"):
-        return "cancelled"
-    outcome = status_of(entry)
-    if outcome == "success":
-        return "completed"
-    if outcome:
-        return "failed"
-    if entry is not None:
-        return "completed"
-    job_id = job["id"]
-    if job_id in running:
-        return "running"
-    if job_id in pending:
-        return "queued"
-    return "unknown"
-
-
-def progress_state(job_id: str, job: dict[str, Any] | None, entry: dict[str, Any] | None,
-                   running: list[str], pending: list[str]) -> str:
-    """The light polling call's state.
-
-    Deliberately a second function rather than a branch of :func:`state_of`: the
-    poller has no tracked job to consult (it may be asking about a job from a
-    previous process) and must answer from the queue alone, which is a different
-    algorithm with different inputs.  Merging them would mean one of the two
-    calls quietly changing its answer.
-    """
-    if job is not None:
-        return state_of(job, running, pending, entry)
-    if entry is not None:
-        return "completed" if not status_of(entry) or status_of(entry) == "success" else "failed"
-    if job_id in running:
-        return "running"
-    if job_id in pending:
-        return "queued"
-    return "unknown"
-
-
-def queue_position(job_id: str, running: list[str], pending: list[str]) -> int | None:
-    """How many jobs are ahead of this one; ``0`` while it is the one running.
-
-    Unlike a percentage, this is a number every implementation can actually
-    compute, which is why the progress endpoint reports it and not an estimate.
-    """
-    if job_id in running:
-        return 0
-    if job_id in pending:
-        return pending.index(job_id)
-    return None
-
-
 # --------------------------------------------------------------------------- #
 # files on this disk
 # --------------------------------------------------------------------------- #
 
-def outputs(prompt_id: str, entry: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Finished images, as paths a client can fetch — never a base to re-join.
-
-    The URL is built from :data:`hamdraw_chp.capabilities.API_ROOT`, which is the
-    same root ``endpoints.output`` publishes, so the address a client reads out of
-    the document and the address it is handed back here are the same string.
-    """
-    if not isinstance(entry, dict):
-        return []
-    outputs_map = entry.get("outputs")
-    if not isinstance(outputs_map, dict):
-        return []
-    files: list[dict[str, Any]] = []
-    for node_output in outputs_map.values():
-        if not isinstance(node_output, dict):
-            continue
-        for image in node_output.get("images") or []:
-            if not isinstance(image, dict):
-                continue
-            filename = str(image.get("filename") or "").strip()
-            if not filename:
-                continue
-            suffix = Path(filename).suffix.lower()
-            files.append(
-                {
-                    "index": len(files),
-                    "filename": filename,
-                    "subfolder": str(image.get("subfolder") or ""),
-                    "type": str(image.get("type") or "output"),
-                    "media_type": MEDIA_TYPES.get(suffix, "image/png"),
-                    "url": f"{capabilities_module.API_ROOT}/jobs/{prompt_id}/output/{len(files)}",
-                }
-            )
-    return files
-
-
-def output_path(kind: str, subfolder: str, filename: str) -> Path | None:
+async def output_path(kind: str, subfolder: str, filename: str) -> Path | None:
     """One output file, or ``None`` — the resolve-and-contain check lives here.
 
     The three roots are a ComfyUI fact (``get_output_directory`` and friends), so
     the lookup belongs to this layer; what the caller does with the answer is the
     protocol layer's business.
+
+    ``async`` for the same reason as :func:`queue`: in service mode the bytes are
+    on another machine and fetching them is I/O.  Here it is a path.
     """
     roots = {
         "output": getattr(folder_paths, "get_output_directory", None),
@@ -415,7 +305,7 @@ async def _drop_pending(job_id: str) -> bool:
     if not callable(remover):
         return False
     try:
-        return bool(await _maybe_await(remover(lambda item: _item_id(item) == job_id)))
+        return bool(await _maybe_await(remover(lambda item: prompt_id_of(item) == job_id)))
     except Exception:
         return False
 

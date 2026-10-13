@@ -357,15 +357,24 @@ def _clean_categories(names: Any) -> list[str]:
 def _clean_key(value: Any) -> str:
     """A posted key string, or a fresh one.  Never the administrator's own credential.
 
-    The check is not politeness.  The data plane reads a ``Basic`` header as "the
-    part after the colon is the key" (``server._token_of``) — so a table entry
-    equal to the console's *password* would make ``Basic hamster:imahamster`` open
-    the data plane.  Refusing to store one is the only place this can be enforced
-    without changing the data plane's existing carriers.
+    两条拒收，各挡一件真事：
+
+    * **与控制台凭据同值的 key** —— 数据面把 ``Basic`` 头读成"冒号之后那段是 key"
+      (``server._token_of``)，所以表里存一个等于控制台**密码**的 key，就使
+      ``Basic hamster:imahamster`` 打开了数据面。只有"拒收"发生在存之前才管得住。
+    * **不认得的字符**（:data:`hamdraw_chp.keys.ALPHABET`：字母、数字、``-``、``_``）——
+      凭据的字母表定死在这里，比较函数那边就不必再为非 ASCII 留一条分支。
+
+    生成的那把（``secrets.token_urlsafe``）本来就落在同一个字母表里，所以"换一把"
+    不需要例外 —— 留在同一处判断，正是为了让那个巧合有个判据看着。
     """
     offered = str(value or "").strip()
     if not offered:
         return secrets.token_urlsafe(KEY_BYTES)
+    if not keys_module.spelling_ok(offered):
+        raise AdminError("bad_request",
+                         "key 只认英文大小写字母、数字、- 和 _。",
+                         detail={"reason": "bad_spelling"})
     credential = load()
     if keys_module.matches(offered, credential["password"]) \
             or keys_module.matches(offered, credential["user"]):

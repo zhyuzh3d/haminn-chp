@@ -47,6 +47,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import types
@@ -160,7 +161,12 @@ class FakeUpstream:
 
 
 class FakeSession:
-    """The stub ``aiohttp.ClientSession``: records the call, answers what the test set."""
+    """The stub ``aiohttp.ClientSession``: records the call, answers what the test set.
+
+    **三个假上游共用一个替身** —— 语音引擎、翻译器、以及服务模式那台 ComfyUI ——
+    按**地址**分派。分派放在这里而不是放进被测代码：服务模式最要紧的一条判据正是
+    「这条请求发去了哪台机器」，而地址只能来自部署侧。
+    """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -174,13 +180,125 @@ class FakeSession:
     async def close(self) -> None:
         pass
 
-    def post(self, url: str, **kwargs: Any) -> FakeUpstream:
+    def request(self, method: str, url: str, **kwargs: Any) -> FakeUpstream:
+        if str(url).startswith(UPSTREAM_BASE):
+            UPSTREAM_CALLS.append({"method": method, "url": url, **kwargs})
+            return _upstream_answer(method, str(url))
         ENGINE_CALLS.append({"url": url, **kwargs})
         answers = TRANSLATOR if "/chat/completions" in url else ENGINE
         failure = answers.get("failure")
         if failure is not None:
             raise failure
         return FakeUpstream(**{key: value for key, value in answers.items() if key != "failure"})
+
+    def post(self, url: str, **kwargs: Any) -> FakeUpstream:
+        return self.request("POST", url, **kwargs)
+
+    def get(self, url: str, **kwargs: Any) -> FakeUpstream:
+        return self.request("GET", url, **kwargs)
+
+
+#: 假上游 ComfyUI（服务模式的后端要问它五件事：清单 / 队列 / 历史 / 提交 / 取图）。
+#: 它按**路径**分派，`UPSTREAM` 里没有的路径一律 404 —— 一个"什么都能答"的替身会让
+#: "它到底问了哪一条"这条判据失效。
+UPSTREAM_BASE = "http://127.0.0.1:8188"
+UPSTREAM: dict[str, Any] = {}
+UPSTREAM_CALLS: list[dict[str, Any]] = []
+
+#: 上游对 ``object_info`` 的答法 —— **写死的那一份**，不从 ``comfy_http.FOLDER_NODES``
+#: 派生：派生的话，「节点名或字段名写错了」这种变异会被替身跟着一起改掉，于是永远绿。
+#: 这份清单里只有 checkpoints，因为假磁盘上也只装了它 —— 两种模式必须说同一件事。
+UPSTREAM_OBJECT_INFO: dict[str, Any] = {
+    "CheckpointLoaderSimple": {"input": {"required": {
+        "ckpt_name": [["DreamShaper8_LCM.safetensors", "sd15-realistic.safetensors"], {}]}}},
+}
+
+
+def upstream_answers(**answer: Any) -> None:
+    """Set what the fake upstream does next; ``failure=`` makes it unreachable."""
+    UPSTREAM.clear()
+    UPSTREAM_CALLS.clear()
+    UPSTREAM.update({
+        "object_info": UPSTREAM_OBJECT_INFO,
+        "queue": {"queue_running": [], "queue_pending": []},
+        "history": {},
+        "prompt_id": "up-1",
+        "upload": {"name": "uploaded.png", "subfolder": "hamdraw"},
+        "image": b"\x89PNG\r\n\x1a\nfetched",
+        "refuse": None,
+    })
+    UPSTREAM.update(answer)
+
+
+def _answered(payload: Any, status: int = 200) -> FakeUpstream:
+    return FakeUpstream(status, body=json.dumps(payload).encode("utf-8"))
+
+
+def _upstream_answer(method: str, url: str) -> FakeUpstream:
+    failure = UPSTREAM.get("failure")
+    if failure is not None:
+        raise failure
+    path = url[len(UPSTREAM_BASE):].split("?")[0]
+    if path == "/object_info":
+        return _answered(UPSTREAM["object_info"])
+    if path == "/queue":
+        return _answered(UPSTREAM["queue"]) if method == "GET" else _answered({})
+    if path.startswith("/history/"):
+        prompt_id = path.rsplit("/", 1)[-1]
+        entry = (UPSTREAM["history"] or {}).get(prompt_id)
+        return _answered({prompt_id: entry} if entry is not None else {})
+    if path == "/prompt":
+        if UPSTREAM["refuse"] is not None:
+            return _answered(UPSTREAM["refuse"], status=400)
+        return _answered({"prompt_id": UPSTREAM["prompt_id"]})
+    if path == "/upload/image":
+        return _answered(UPSTREAM["upload"])
+    if path in ("/interrupt",):
+        return _answered({})
+    if path == "/view":
+        return FakeUpstream(200, body=UPSTREAM["image"])
+    return FakeUpstream(404, body=b"{}")
+
+
+class FakeApplication:
+    """The little of ``aiohttp.web.Application`` the service needs: router + ceiling.
+
+    ``router`` 是 :class:`FakeDispatcher`（真 aiohttp 那个形状），不是插件那个形状 ——
+    服务模式挂的是**活的 app**，两者只差一处写法，而那一处正是曾经踩过的坑。
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self._client_max_size = kwargs.get("client_max_size")
+        self.router = FakeDispatcher()
+
+
+class FakeAppRunner:
+    def __init__(self, application: Any = None) -> None:
+        self.application = application
+
+    async def setup(self) -> None:
+        pass
+
+    async def cleanup(self) -> None:
+        pass
+
+
+class FakeSite:
+    def __init__(self, runner: Any, host: str, port: int) -> None:
+        self.runner = runner
+        self.host = host
+        self.port = port
+        self.started = False
+        BOUND.append(self)
+
+    async def start(self) -> None:
+        self.started = True
+
+
+#: 每一个被构造出来的 site —— 「配置里那个端口真的绑上去了吗」只能从这里看。
+#: ``cli.serve`` 永不返回（它就是在那里等），所以那条判据只能靠掐时间 + 看这个。
+BOUND: list[FakeSite] = []
 
 
 def _json_response(payload: Any, status: int = 200, dumps: Any = None,
@@ -199,10 +317,13 @@ def _json_response(payload: Any, status: int = 200, dumps: Any = None,
 # the stub has to be able to carry a request: ``ClientTimeout`` takes keywords,
 # ``ClientSession`` is the recorded fake above, and the two error classes exist
 # so ``except aiohttp.ClientError`` has something to name.
+# 服务模式又多要三样: 一个 app（它自己绑端口）、一个 runner、一个 site。
 _stub("aiohttp", ClientSession=FakeSession, ClientTimeout=lambda **kwargs: kwargs,
       ClientError=FakeClientError, ClientConnectionError=FakeConnectionError,
       web=types.SimpleNamespace(json_response=_json_response, Response=FakeResponse,
-                                StreamResponse=FakeStreamResponse))
+                                StreamResponse=FakeStreamResponse,
+                                Application=FakeApplication, AppRunner=FakeAppRunner,
+                                TCPSite=FakeSite))
 # nodes.py imports these; the folder listing is a fixed little catalogue so the
 # config node can be exercised without ComfyUI.
 _MODEL_FILES = {"checkpoints": ["DreamShaper8_LCM.safetensors", "sd15-realistic.safetensors"]}
@@ -239,7 +360,21 @@ os.environ["HAMDRAW_ADMIN"] = str(_SCRATCH / "chp_admin.json")
 for _name in ("HAMDRAW_PASSWORD", "HAMDRAW_TRANSLATE_URL", "HAMDRAW_TRANSLATE_MODEL"):
     os.environ.pop(_name, None)
 
-from hamdraw_chp import admin, backends, capabilities, families, keys, server, settings, speech as speech_module, translate, version  # noqa: E402
+# 插件那一半是在 **import 时**把路由挂上去的（``__init__`` 结尾那句 ``register_routes()``），
+# 所以那条路上出的事故轮不到任何一条用例来认领 —— 这个文件根本加载不下去。
+# 这类失败必须**当场点名**：变异脚本按"是哪条断言抓的"判定，而一条没人认领的红在这份仓里
+# 等同于没抓住（``gateway()`` 那段注释说的是同一件事）。只接 ``AttributeError``：
+# 别的 import 错误是本仓自己的事，照原样炸出来才有诊断价值。
+try:
+    from hamdraw_chp import admin, backends, capabilities, families, keys, nodes as nodes_module  # noqa: E402
+    from hamdraw_chp import server, settings, speech as speech_module, translate, version  # noqa: E402
+    from hamdraw_chp import cli  # noqa: E402
+    import hamdraw_chp as package  # noqa: E402  —— 包自己（"这条 import 宽厚只给 ComfyUI"那条判据要读它）
+except AttributeError as error:  # noqa: BLE001
+    raise AssertionError(
+        f"插件那一半在 import 时就挂不上路由了（GET 路由不对）："
+        f"{type(error).__name__}: {error}") from None
+from hamdraw_chp.backends import comfy_http  # noqa: E402
 
 
 def check(condition: bool, message: str) -> None:
@@ -948,6 +1083,38 @@ def check_settings() -> None:
     check(settings.checkpoint("fast") == settings.RECOMMENDED_CHECKPOINT, "读坏了就退回默认")
     forget_settings()
 
+    # 服务模式那一档：**唯一**一组带默认值的部署事实（服务模式没有它起不来），
+    # 而它照样只从这份文件里读 —— 地址永远不走 HTTP（§4.3）。
+    serve = settings.serve()
+    check((serve["host"], serve["port"]) == (settings.DEFAULT_SERVE_HOST, settings.DEFAULT_SERVE_PORT),
+          f"出厂绑定该是本机 + 8889, 得到 {serve}")
+    check(serve["host"] == "127.0.0.1", "默认只听本机 —— 要暴露是一个决定, 不该是默认")
+    check(serve["upstream"] == settings.DEFAULT_UPSTREAM, "上游出厂值是 ComfyUI 自己的默认端口")
+    check(set(settings.DEFAULTS["serve"]) == {"host", "port", "upstream"},
+          f"serve 一档就这三个, 得到 {sorted(settings.DEFAULTS['serve'])}")
+    write_settings(serve={"host": "0.0.0.0", "port": "9911", "upstream": settings.DEFAULT_UPSTREAM + "/"})
+    moved = settings.serve()
+    check(moved["port"] == 9911, f"端口读回来要是整数, 得到 {moved['port']!r}")
+    check(moved["upstream"] == settings.DEFAULT_UPSTREAM,
+          f"上游地址尾部的斜杠要去掉(不然拼出来是双斜杠), 得到 {moved['upstream']}")
+    # 规范化的地方**不止一处**（写文件那一侧 `_merge` 也去一次），所以只读
+    # `serve()` 的话，把 `_merge` 那一处拆掉照样绿 —— 那种变异是"等价变异"，
+    # 抓不到就等于没写。这里读的是另一个公开读者（`load()`）：任何读这份配置的
+    # 人拿到的都该是已经干净的值，而不是"只有 serve() 会替你擦一遍"。
+    check(settings.load()["serve"]["upstream"] == settings.DEFAULT_UPSTREAM,
+          f"上游地址尾部的斜杠要去掉(不然拼出来是双斜杠) —— 文件读出来那一刻就该是干净的, "
+          f"得到 {settings.load()['serve']['upstream']}")
+    write_settings(serve={"port": 0, "host": "  "})
+    clamped = settings.serve()
+    check(clamped["port"] == 1, f"端口 0 要被夹进合法区间, 得到 {clamped['port']}")
+    check(clamped["host"] == settings.DEFAULT_SERVE_HOST, "空的绑定地址等于没写")
+    write_settings(serve={"port": "不是数字"})
+    check(settings.serve()["port"] == settings.DEFAULT_SERVE_PORT,
+          "读不出来的端口要退回默认, 而不是夹成 1")
+    write_settings(serve="这不是一份配置")
+    check(settings.serve()["port"] == settings.DEFAULT_SERVE_PORT, "整块写坏了也要退回默认")
+    forget_settings()
+
 
 # --------------------------------------------------------------------------- #
 # the request path — driven, not inspected
@@ -974,6 +1141,13 @@ class FakeQueue:
 
 
 class FakeRoutes:
+    """**ComfyUI 那一半**的路由表：``RouteTableDef``（``get(path)`` 返回装饰器）。
+
+    它与下面那个 :class:`FakeDispatcher` 是**两种真的形状**，都留着、都不许退化：
+    只留一种，另一种写法就永远绿 —— 实测过一次，服务模式第一行路由就
+    ``TypeError: 'NoneType' object is not callable``，而离线自检全绿。
+    """
+
     def __init__(self) -> None:
         self.registered: dict[str, set[str]] = {"GET": set(), "POST": set(), "DELETE": set()}
 
@@ -988,6 +1162,27 @@ class FakeRoutes:
     def delete(self, path: str):
         self.registered["DELETE"].add(path)
         return lambda handler: handler
+
+
+class FakeDispatcher:
+    """**服务那一半**的路由表：真的 ``aiohttp`` —— ``add_get(path, handler)``。
+
+    这里**没有** ``get`` / ``post`` / ``delete``，而且它不是 :class:`FakeRoutes` 的子类，
+    就是为了让"选错分支"变成一声响（``AttributeError``）—— 若两种写法都能挂上，这条
+    判据就白写了。
+    """
+
+    def __init__(self) -> None:
+        self.registered: dict[str, set[str]] = {"GET": set(), "POST": set(), "DELETE": set()}
+
+    def add_get(self, path: str, handler: Any) -> None:
+        self.registered["GET"].add(path)
+
+    def add_post(self, path: str, handler: Any) -> None:
+        self.registered["POST"].add(path)
+
+    def add_delete(self, path: str, handler: Any) -> None:
+        self.registered["DELETE"].add(path)
 
 
 class FakePromptServer:
@@ -2327,7 +2522,19 @@ def check_server_surface() -> None:
         check(token not in seam_source, f"server.py 里不该再出现 {token}")
     check(server.backend is backends.comfy_inproc, "协议层连的就是那个 inproc 后端")
     check(backends.BACKENDS["http"] == "comfy_http", "服务模式的后端已经在表里占好位")
+    check(backends.SERVICE == "http", "服务模式的入口按名字问后端，那个名字只写一处")
     check(backends.get("inproc") is backends.comfy_inproc, "按名字取后端")
+    check(backends.get(backends.SERVICE) is comfy_http, "服务模式那个后端要真的取得到")
+    # 两个后端必须答同一批问题 —— 少一个函数, 换后端就是运行到一半才炸。
+    for name in ("abilities", "available", "absent", "input_directory", "output_path",
+                 "queue", "history", "submit", "cancel", "outputs", "state_of",
+                 "progress_state", "queue_position", "status_of", "error_of",
+                 "routes", "limit_body"):
+        check(callable(getattr(backends.comfy_inproc, name, None)),
+              f"插件后端少了 {name}")
+        check(callable(getattr(comfy_http, name, None)), f"服务后端少了 {name}")
+    check(comfy_http.outputs is backends.comfy_inproc.outputs,
+          "产物地址那段必须是**同一个函数** —— 分两份迟早在一种模式下走样")
     try:
         backends.get("nope")
     except ValueError as error:
@@ -2341,7 +2548,9 @@ def check_server_surface() -> None:
         "image_base64", "mask_base64", "ext_params", "chp_params",
         "request_id"}),
         f"认得的顶层字段变了: {sorted(server.RECOGNISED_FIELDS)}")
-    for gone in ("capability", "task", "size", "steps", "negative_prompt", "ignores"):
+    for gone in ("capability", "task", "size", "steps", "negative_prompt", "ignores",
+                 # 上游地址只在部署侧 —— 客户端连一个能写它的字段都没有（§4.3）。
+                 "upstream", "backend", "mode"):
         check(gone not in server.RECOGNISED_FIELDS, f"{gone} 不再是顶层字段")
 
     expected = {
@@ -2349,6 +2558,8 @@ def check_server_surface() -> None:
         "unsupported_size": 400, "unsupported_steps": 400, "bad_image": 400, "bad_mask": 400,
         "stretched_reference": 400, "no_model": 409, "invalid_workflow": 400,
         "busy": 429, "duplicate_request": 409, "not_found": 404, "internal": 500,
+        # 服务模式独有：那台跑模型的机器不在。码从 capabilities 来（后端要判定它）。
+        capabilities.NO_UPSTREAM: 409,
     }
     for code, status in expected.items():
         check(server.ERROR_STATUS.get(code) == status, f"{code} 的状态码要是 {status}")
@@ -2406,10 +2617,393 @@ def check_routes() -> None:
     check(set(response.payload["endpoints"]) == set(capabilities.ENDPOINTS), "接口要播报地址")
 
 
+# --------------------------------------------------------------------------- #
+# the service mode (S5)
+# --------------------------------------------------------------------------- #
+
+#: 服务模式那把 key —— 判据①要求在**同一个 key** 下比两份文档，否则比出来的是
+#: 「两个 key 的授权不同」，而不是「两种模式的协议相同」。
+SERVICE_KEY = "k_service"
+SERVICE_AUTH = {"Authorization": f"Bearer {SERVICE_KEY}"}
+
+
+def document_bytes(headers: dict[str, str]) -> str:
+    """``/chp/info`` 的响应体，原样 —— 逐字节比较要的就是"原样"这两个字。"""
+    response = info_with(headers)
+    check(response.status == 200, f"带对 key 的信息接口要 200, 得到 {response.status}")
+    return json.dumps(response.payload, ensure_ascii=False)
+
+
+#: 服务模式写参考图的地方**不是**插件那个目录（它写不进上游的磁盘）：图先落在本机
+#: 暂存处，提交时才上传。所以"拒绝发生在写盘之前"这条要在这个目录上量。
+def service_input_files() -> set[str]:
+    directory = comfy_http.INPUT_DIRECTORY / comfy_http.INPUT_SUBFOLDER
+    return {item.name for item in directory.iterdir()} if directory.is_dir() else set()
+
+
+def check_service_mode() -> None:
+    """S5 · 服务模式：一个包、两个入口（计划 §4.3）。
+
+    判据三条，一条比一条硬：① 同一个 key 下两种模式的文档**逐字节相同** —— 那是
+    「两种模式是同一个协议」的唯一证据；② 上游不在时文档照答 200 且说得出原因 ——
+    「后端缺席 ≠ 服务缺席」；③ 端口与上游从部署侧配置读，客户端一行不改。
+
+    这三条都建立在同一件事上：**换的是后端，不是协议层**。所以下面每条断言都在读
+    协议层看得见的东西（文档、错误码、回执），没有一条去读后端内部的状态。
+    """
+    upstream_answers()
+    forget_settings()
+    try:
+        check(settings.DEFAULT_UPSTREAM == UPSTREAM_BASE,
+              f"假上游的地址必须就是出厂默认值, 得到 {settings.DEFAULT_UPSTREAM}")
+
+        # ③ 端口与绑定从配置读；而上游地址**不是请求字段**，客户端连写它的地方都没有。
+        #    文档里那些地址全是相对路径 —— 换端口不用改客户端，正是靠这一条成立的。
+        plan = cli.plan()
+        check((plan["host"], plan["port"], plan["upstream"])
+              == (settings.DEFAULT_SERVE_HOST, settings.DEFAULT_SERVE_PORT, UPSTREAM_BASE),
+              f"服务模式出厂该在 {settings.DEFAULT_SERVE_HOST}:{settings.DEFAULT_SERVE_PORT}, 得到 {plan}")
+        check(plan["document"] == f"http://{plan['host']}:{plan['port']}{server.API_ROOT}/info",
+              f"启动行里那条 URL 要是运维真能打开的那一条, 得到 {plan['document']}")
+        write_settings(serve={"host": "0.0.0.0", "port": 9911})
+        moved = cli.plan()
+        check((moved["host"], moved["port"]) == ("0.0.0.0", 9911),
+              f"改了配置就要生效（改完要重启, 但不许另有一套缓存）, 得到 {moved}")
+        check(all(str(value).startswith("/") for value in capabilities.ENDPOINTS.values()),
+              "文档里的地址必须全是相对路径 —— 换端口不改客户端靠的就是这一条")
+        check("upstream" not in server.RECOGNISED_FIELDS,
+              "上游地址不许成为请求字段：否则一把 key 就等于'拿你的钥匙打任意地址'")
+        # 「读了但没用」只有行为看得出来：换一个上游地址，下一条请求真的换了台机器。
+        write_settings(serve={"upstream": "http://10.0.0.9:8188"})
+        ENGINE_CALLS.clear()
+        asyncio.run(comfy_http.queue())
+        check(ENGINE_CALLS and ENGINE_CALLS[-1]["url"].startswith("http://10.0.0.9:8188/"),
+              f"上游地址必须每次从配置读, 得到 {ENGINE_CALLS[-1]['url'] if ENGINE_CALLS else '一次都没发'}")
+        forget_settings()
+
+        # 服务模式的 app：请求体上限在**构造时**给它，同一批路由挂上去 —— 路由是
+        # server.py 登记的，所以控制台那七条也一起在这儿，一条都不用重写。
+        # ⚠ 这几条要排在①之前：它们会改设置文件，而①要求两边读到**同一份**配置
+        #   （这不是风格问题 —— 之前正是顺序反了，服务那一份少了模型配置，文档必然不同）。
+        # 包在 gateway 里：两种路由表只差一处写法，挂错了那一种就是一声 AttributeError，
+        # 而"没人认领的红"在这份仓里等同于没抓住（这条真的踩过：服务模式第一行路由就炸）。
+        application = gateway("服务模式要把同一批路由挂到自己的 app 上", cli.build_app)
+        check(application._client_max_size == server.MAX_BODY_BYTES,
+              "服务模式的 app 要把请求体上限带上（这个模式下没有第二个地方设它）")
+        wired = application.router.registered
+        check(f"{server.API_ROOT}/info" in wired["GET"] and f"{server.API_ROOT}/jobs" in wired["POST"],
+              f"服务模式要把同一批路由挂到自己的 app 上, 得到 {sorted(wired['GET'])}")
+        check(admin.ADMIN_ROOT in wired["GET"] and admin.KEY_PATH in wired["DELETE"],
+              "控制台也在服务模式里 —— 它是同一个服务、同一个端口")
+
+        # ③ 的另一半: 配置里那个地址**真的绑上去了**。serve() 是在那儿等的, 所以只能
+        #    掐时间把它掐掉, 再看它到底构造了哪个 site —— "读了配置但绑的是别的端口"
+        #    正是这条判据要抓的东西。
+        write_settings(serve={"host": "0.0.0.0", "port": 9911})
+        chosen = cli.plan()
+        BOUND.clear()
+        with contextlib.suppress(asyncio.TimeoutError):
+            asyncio.run(asyncio.wait_for(
+                cli.serve(application, chosen["host"], chosen["port"]), timeout=0.05))
+        check([(site.host, site.port) for site in BOUND if site.started] == [("0.0.0.0", 9911)],
+              f"绑定的必须是配置里那个地址, 得到 {[(site.host, site.port) for site in BOUND]}")
+        forget_settings()
+
+        # ① 逐字节相同。先让能力**真的在**：两边都不 ready 的文档比出来只是两个空表。
+        #    **插件那一份要在换后端之前取** —— 换完再取，比的是两份服务模式的文档，
+        #    那种断言在两种模式真的分叉时照样绿。
+        write_keys(key_entry(SERVICE_KEY, [keys.ALL]))
+        forget_settings()
+        use_render()
+        plugin_document = document_bytes(SERVICE_AUTH)
+        check('"ready": true' in plugin_document, "插件模式下这两条能力该是 ready 的")
+
+        server.use_backend(backends.SERVICE)
+        upstream_answers()
+        check(asyncio.run(comfy_http.refresh()) is True, "上游在的时候 refresh 要答是")
+        service_document = document_bytes(SERVICE_AUTH)
+        check(service_document == plugin_document,
+              "同一个 key 下, 服务模式与插件模式的文档必须逐字节相同")
+
+        # 换后端必须连「清单从哪来」一起换掉。做法是让两边**真的不一致**：配一个
+        # 只在上游装着的 checkpoint —— 上游看得到它，本机磁盘上并没有这个文件。
+        # （只换 backend 不换那个闭包，就是"文档在描述一台作业已经不会去的机器"。）
+        only_upstream = "only-upstream.safetensors"
+        UPSTREAM["object_info"] = {"CheckpointLoaderSimple": {"input": {"required": {
+            "ckpt_name": [[only_upstream], {}]}}}}
+        settings.update(checkpoints={name: only_upstream for name in settings.TASKS})
+        asyncio.run(comfy_http.refresh())
+        check(server._abilities_of("fast")["ready"] is True, "服务模式按上游的清单判")
+        server.use_backend(backends.DEFAULT)
+        check(server._abilities_of("fast")["ready"] is False, "插件模式按本机磁盘判")
+        server.use_backend(backends.SERVICE)
+        upstream_answers()
+
+        # 但"清单是从上游读出来的"这件事还差一条判据：上面那份 object_info 是**写死的**，
+        # 里面就一个加载器节点。节点名或字段名抄错 ⇒ 那一格永远读不出东西，而"读不出来"
+        # 在这一层恰好等于"上游没有这个 loader 节点 = 不敢判 = 不缺" ⇒ 文档会照说 ready，
+        # 一个名字都不核对。所以这条打在"到底读出来了什么"上，不打在 ready 上。
+        check(comfy_http.available("checkpoints") == [only_upstream],
+              f"上游答的那几个 checkpoint 名字要能读出来（读不出来就一个都不核对）, "
+              f"得到 {comfy_http.available('checkpoints')}")
+        # 反面: 上游**列了**这个目录、而里面没有的那个名字就是缺的 —— 缺要真的写进文档。
+        settings.update(checkpoints={name: "两边都没有的.safetensors" for name in settings.TASKS})
+        asyncio.run(comfy_http.refresh())
+        check(server._abilities_of("fast")["ready"] is False,
+              "上游列了这个目录、而里面没有的名字就是缺的（不然文档在描述一个上游没有的模型）")
+        settings.update(checkpoints={name: only_upstream for name in settings.TASKS})
+        asyncio.run(comfy_http.refresh())
+
+        # ② 上游不在：文档照答，而且说得出原因 —— 而且**不是**"你没配模型"那句，
+        #    两件事要人做的是两件不同的事。
+        upstream_answers(failure=FakeConnectionError("上游不在"))
+        check(asyncio.run(comfy_http.refresh()) is False, "问不到上游时 refresh 要如实报否")
+        down = info_with(SERVICE_AUTH)
+        check(down.status == 200, "上游不在时 /chp/info 仍要 200（后端缺席不等于服务缺席）")
+        check(all(not ability["ready"] for ability in down.payload["abilities"]),
+              "上游不在时一条能力都不许是 ready")
+        check(capabilities.NO_UPSTREAM in down.payload.get("errors", []), "文档的 errors 里要有那个码")
+        check(capabilities.NO_UPSTREAM in server.ERROR_STATUS
+              and capabilities.NO_UPSTREAM in server.ERROR_MESSAGES,
+              "那个码在实现里要真的能回、真的有话说 —— 不然文档就是在列一个空头承诺")
+        use_render()
+        before = service_input_files()
+        refused = asyncio.run(server.create_job(FakeRequest(body_for("render"), SERVICE_AUTH)))
+        check(error_code_of(refused) == capabilities.NO_UPSTREAM,
+              f"上游不在时提交要回 {capabilities.NO_UPSTREAM}, 得到 {error_code_of(refused)}")
+        check(service_input_files() == before,
+              "上游不在时一个字节的参考图都不该落盘 —— 拒绝要发生在写盘之前")
+        upstream_answers()
+
+        # 作业号：服务模式自己发号，上游的 prompt_id 只活在这个后端里 —— 而客户端
+        # 拿到的每一个地址都必须是它自己那个号。
+        check(asyncio.run(comfy_http.refresh()) is True, "上游回来了")
+        graph = {"9": {"class_type": "LoadImage", "inputs": {"image": "hamdraw/ref.png"}}}
+        reference = comfy_http.INPUT_DIRECTORY / "hamdraw" / "ref.png"
+        reference.parent.mkdir(parents=True, exist_ok=True)
+        reference.write_bytes(base64.b64decode(TINY_PNG))
+        UPSTREAM["upload"] = {"name": "renamed.png", "subfolder": "hamdraw"}
+        UPSTREAM_CALLS.clear()
+        job_id = asyncio.run(comfy_http.submit(graph))
+        check(job_id != UPSTREAM["prompt_id"], "服务模式要发自己的作业号，不是上游那个")
+        check(graph["9"]["inputs"]["image"] == "hamdraw/renamed.png",
+              f"图里那一格要改成上游答的名字, 得到 {graph['9']['inputs']['image']}")
+        uploads = [call for call in UPSTREAM_CALLS if call["url"].endswith("/upload/image")]
+        check(len(uploads) == 1, f"参考图要真的传上去一次, 得到 {len(uploads)} 次")
+        check(b"ref.png" in uploads[0]["data"] and b"hamdraw" in uploads[0]["data"],
+              "上传的表单里要带文件名与子目录 —— 上游靠这两个值决定放哪")
+
+        UPSTREAM["queue"] = {"queue_running": [], "queue_pending": [[3, UPSTREAM["prompt_id"],
+                                                                    {}, {}, [], {}]]}
+        check(asyncio.run(comfy_http.queue()) == ([], [job_id]),
+              "上游队列里的 prompt_id 要翻成我们的作业号")
+        UPSTREAM["queue"] = {"queue_pending": [[3, "别人的作业", {}, {}, [], {}]]}
+        check(asyncio.run(comfy_http.queue()) == ([], []),
+              "不是这台服务交的作业不许冒充成我们的 —— 那会让 queue_position 变成别人的号码")
+        UPSTREAM["history"] = {UPSTREAM["prompt_id"]: {
+            "outputs": {"9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"}]}}}}
+        files = comfy_http.outputs(job_id, asyncio.run(comfy_http.history(job_id)))
+        check([item["url"] for item in files] == [f"{server.API_ROOT}/jobs/{job_id}/output/0"],
+              f"产物地址要指向**我们的**作业号, 得到 {[item['url'] for item in files]}")
+        fetched = asyncio.run(comfy_http.output_path("output", "", "a.png"))
+        check(fetched is not None and fetched.read_bytes() == UPSTREAM["image"],
+              "产物要真的取回到本机（server.py 用 FileResponse 发它, 所以要一个路径）")
+
+        # 取消：排队中的删队、正在跑的打断 —— 与插件模式同一个判断，只是换了两条上游调用。
+        UPSTREAM_CALLS.clear()
+        check(asyncio.run(comfy_http.cancel(job_id, [], [job_id])) is True, "排队中的要撤得掉")
+        check(UPSTREAM_CALLS[-1]["url"] == f"{UPSTREAM_BASE}/queue"
+              and UPSTREAM_CALLS[-1]["json"] == {"delete": [UPSTREAM["prompt_id"]]},
+              f"撤排队中的要带上上游那个 prompt_id, 得到 {UPSTREAM_CALLS[-1]}")
+        check(asyncio.run(comfy_http.cancel(job_id, [job_id], [])) is True, "正在跑的要打得断")
+        check(UPSTREAM_CALLS[-1]["url"] == f"{UPSTREAM_BASE}/interrupt",
+              f"正在跑的那条走 /interrupt, 得到 {UPSTREAM_CALLS[-1]['url']}")
+        check(asyncio.run(comfy_http.cancel("没见过的号", [], [])) is False, "不认识的作业号撤不动")
+
+        # 本机这一侧: 参考图先落在暂存目录, 打包时它不在包里（它是临时文件, 不是设置）。
+        check(comfy_http.input_directory() == comfy_http.INPUT_DIRECTORY,
+              "服务模式写参考图的地方是本机暂存目录 —— 它写不进上游的磁盘")
+        check(comfy_http.routes() is None, "服务模式的后端自己没有路由表: 路由挂在 app 上")
+        check(comfy_http.limit_body(1024) is None, "这个模式下上限在 app 构造时就给了")
+
+        # 上游答得不成样子（不是 HTTP 错误, 是答非所问）也算问不到 —— 一个空 dict
+        # 会被当成"它一件模型都没有", 于是文档说 ready:false 而原因却是错的。
+        UPSTREAM["object_info"] = "这不是一份 object_info"
+        check(asyncio.run(comfy_http.refresh()) is False, "答非所问的清单不算答上了")
+        UPSTREAM["object_info"] = {}
+        check(asyncio.run(comfy_http.refresh()) is True,
+              "问到了但一件都没有, 那是答上了 —— '不敢判'与'真的没有'是两件事")
+        check(comfy_http.available("checkpoints") == [], "空清单就是空")
+        check(comfy_http.absent("checkpoints", "x.safetensors") is False,
+              "问到了、但这个目录是空的 ⇒ 不敢判, 与插件模式同义")
+    finally:
+        server.use_backend(backends.DEFAULT)
+        comfy_http.forget()
+        forget_keys()
+        forget_settings()
+        upstream_answers()
+
+
+#: 子进程里的 aiohttp 替身。**它不是这条要测的变量**：两种模式都真的需要 aiohttp
+#: （插件那份随 ComfyUI 一起来，服务模式自己带），所以这里只让它够 ``import`` 过 ——
+#: 留下的唯一变量是「ComfyUI 那三个模块在不在」。（aiohttp 缺席时 `import hamdraw_chp`
+#: 本来就会失败，那是真的依赖，不是要宽厚掉的东西。）
+_CHILD_PRELUDE = ("import sys, types\n"
+                  "aiohttp = types.ModuleType('aiohttp')\n"
+                  "aiohttp.web = types.SimpleNamespace()\n"
+                  "sys.modules['aiohttp'] = aiohttp\n")
+
+
+def _child(script: str) -> subprocess.CompletedProcess:
+    """Run a snippet in a **separate** interpreter with only this repo on the path.
+
+    ``cwd`` is the scratch directory, not the repository: if whoever runs the
+    suite happens to sit inside a ComfyUI tree, an implicit ``''`` on ``sys.path``
+    would hand that tree's ``folder_paths.py`` to the child and turn the first
+    assertion below into a false green on exactly the machine that has one.
+    """
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(ROOT)
+    environment.pop("HAMDRAW_PASSWORD", None)
+    for name in ("HAMDRAW_SETTINGS", "HAMDRAW_KEYS", "HAMDRAW_ADMIN"):
+        environment[name] = str(_SCRATCH / ("standalone-" + name.lower() + ".json"))
+    return subprocess.run([sys.executable, "-c", _CHILD_PRELUDE + script], cwd=str(_SCRATCH),
+                          capture_output=True, text=True, env=environment, timeout=120)
+
+
+def check_standalone_import() -> None:
+    """服务模式的**前提**：这台机器上没有 ComfyUI，这个包也得 import 得起来。
+
+    ⚠ 这一条在**进程内永远为真** —— 本文件在上面把 ``folder_paths`` 那几个替身塞进了
+    ``sys.modules``，所以在进程内它什么都替不了。只有另起一个解释器、把 ComfyUI 从
+    路上真的拿掉，才等于 ``python -m hamdraw_chp serve`` 在真机上被启动时的处境。
+    （写这一条之前，``serve`` 连 import 都过不去 —— 而 ``__init__`` 末尾那句 print
+    还在一本正经地告诉你去跑它。）
+    """
+    done = _child("import hamdraw_chp as chp;"
+                  "print('nodes=', sorted(chp.NODE_CLASS_MAPPINGS))")
+    last = (done.stderr.strip().splitlines() or [""])[-1]
+    check(done.returncode == 0,
+          f"没有 ComfyUI 也要能 import（服务模式就是这么起来的）: 退出码 {done.returncode} {last}")
+    check("未检测到 ComfyUI" in done.stdout,
+          f"没有 ComfyUI 时它要自己说明插件那一半没接上, 得到 {done.stdout.strip()!r}")
+    check("nodes= []" in done.stdout,
+          f"插件那一半缺席时节点表是空的 —— 而不是没有这个名字, 得到 {done.stdout.strip()!r}")
+
+    # 判据的另一半：**这条宽厚只给 ComfyUI**。上面那条另起进程的用例只能证明"没有
+    # ComfyUI 时 import 得起来"，证明不了"别的缺失也会照原样炸" —— 而后者才是要紧的
+    # 一半：把它也吞掉，插件会在 ComfyUI 里**静悄悄地一个人都不注册**。
+    # 这一半今天在真实 import 图里造不出来（`nodes.py` 与 `comfy_inproc` 只 import
+    # ComfyUI 与自家人），所以判在那条**单独的判断函数**上 —— 它不是为测试拆出来的，
+    # 它是这个 guard 唯一需要解释的一句：哪些缺失算"这里没有 ComfyUI"。
+    for name, expected in (("folder_paths", True), ("nodes", True), ("execution", True),
+                           ("aiohttp", False), ("torch", False),
+                           ("hamdraw_chp.backends.records", False)):
+        error = ModuleNotFoundError(f"No module named {name!r}", name=name)
+        check(package.missing_is_comfyui(error) is expected,
+              f"{name} 缺了：应当判成 "
+              f"{'「这里没有 ComfyUI」' if expected else '「这包坏了」'}")
+
+
+def check_credential_spelling() -> None:
+    """凭据的字母表：**英文大小写字母、数字、``-``、``_``**，业主 2026-10-13 定。
+
+    中文不必支持，所以它不是"比对时要绕开的一种输入"，而是一条**收进来那一刻就拒**的
+    规矩。这条规矩横跨三处（表 / 控制台 / 配置节点），一处漏掉，"支持"就从那一半漏回来；
+    而**送上来的**那一串仍旧不受限制 —— 那句话该是 401，不是 500（下面最后一条）。
+    """
+    # ① 定义本身。
+    spelled = {"abc": True, "ABC123": True, "a-b_c": True, "k-9_x-2026": True,
+               "": False, "中文": False, "with space": False, "a:b": False,
+               "a.b": False, "ключ": False, "a\n": False, "a-b/": False}
+    for value, expected in spelled.items():
+        check(keys.spelling_ok(value) is expected,
+              f"凭据的字母表只认英文大小写字母、数字、- 和 _：{value!r} 该是 {expected}")
+
+    # ② 控制台是"收进来"的那道门。拒了不许留半行；不认得的写法一个个都要拒。
+    forget_keys()
+    try:
+        for offered in ("中文key", "has space", "a:b", "密钥-2026"):
+            refused = admin_ok(server.admin_keys_create, {"label": "不认得的写法", "key": offered})
+            check(refused.status == 400
+                  and (refused.payload.get("detail") or {}).get("reason") == "bad_spelling",
+                  f"控制台不该收下 {offered!r} 这把 key, 得到 {refused.status} {refused.payload}")
+            check(keys.read() == [], "被拒的 key 不许留下半行")
+        # 生成的那把也要落在同一个字母表里：`secrets.token_urlsafe` 正好落在里面，
+        # 但那是巧合 —— "换一把"给出自己都不收的东西，是这条规矩最可笑的一种破法。
+        generated = admin_ok(server.admin_keys_create, {"label": "生成一把"}).payload["key"]
+        check(keys.spelling_ok(generated),
+              f"生成的那把也要落在同一个字母表里, 得到 {generated!r}")
+        accepted = admin_ok(server.admin_keys_create, {"label": "认得", "key": "k-2026_x"})
+        check(accepted.status == 201, f"认得的写法照旧要收下, 得到 {accepted.payload}")
+    finally:
+        forget_keys()
+
+    # ③ 配置节点那一格就是**默认钥匙**，同一个字母表。空着照旧是"关掉鉴权"（那是文档里
+    #    明说的用法），所以拒收只针对非空的那一半。
+    forget_settings()
+    try:
+        before = settings.load()
+        for bad in ("中文密码", "has space"):
+            try:
+                nodes_module.HamDrawConfig().apply(bad, "a.safetensors", "b.safetensors",
+                                                   "c.safetensors")
+            except ValueError as error:
+                check("英文大小写字母" in str(error),
+                      f"节点拒收的时候要说清认得的字符, 得到 {error}")
+            else:
+                raise AssertionError(f"不认得的密码 {bad!r} 应当被拒，而不是悄悄存下来")
+        check(settings.load() == before, "被拒的那一次 Queue 不许写下任何东西")
+        nodes_module.HamDrawConfig().apply("pw-under-test", "a.safetensors",
+                                          "b.safetensors", "c.safetensors")
+        check(settings.password() == "pw-under-test",
+              f"认得的密码照旧要收下, 得到 {settings.password()!r}")
+        nodes_module.HamDrawConfig().apply("", "a.safetensors", "b.safetensors", "c.safetensors")
+        check(settings.password() == "",
+              "空密码照旧是「关掉鉴权」—— 这条规矩不许把那一半也挡掉")
+    finally:
+        forget_settings()
+
+    # ④ 送上来的那一串不受字母表管：客户端打一串中文，答案是一句干净的 401，不是 500。
+    #    （规矩管的是"我们收下什么"，不是"别人可以打什么"。）
+    forget_keys()
+    try:
+        settings.update(password="pw-plain-ascii")
+        refused = info_with({"Authorization": "Bearer " + "中文密码"})
+        check(refused.status == 401,
+              f"中文的尝试要是一句 401（不是 500，也不是进去）, 得到 {refused.status}")
+        ok = info_with({"Authorization": "Bearer pw-plain-ascii"})
+        check(ok.status == 200, f"认得的那把照旧进得去, 得到 {ok.status}")
+    finally:
+        forget_keys()
+        forget_settings()
+
+
+def check_backend_seam() -> None:
+    """两个入口各自点名后端；装完的那一刻，后端与它的清单闭包都要在位。
+
+    **这一条必须排在最前面**，而且理由不是洁癖：`server._abilities_of` 是 None 时，
+    后面**每一条**用例都会以一句 ``TypeError: 'NoneType' object is not callable``
+    收场 —— 一条没人认领的红。变异脚本按"哪条断言抓的"判定，那种红会被算成逃逸，
+    而它其实是同一个缺陷。`gateway()` 那段注释说的是同一件事。
+
+    「换后端不换清单」为什么单列一条：清单闭包是**对后端的一个闭包**，忘了重建，
+    文档就会描述一台作业已经不会去的机器 —— 而这正是这个接缝存在的理由。
+    """
+    check(server.backend is not None,
+          "启动它的那一个必须点名后端（插件这一半点的是进程内那个）")
+    check(server.backend is backends.get(backends.DEFAULT),
+          f"插件模式点名的就是进程内后端, 得到 {getattr(server.backend, '__name__', server.backend)}")
+    check(callable(server._abilities_of),
+          "点名后端时那个「清单从哪来」的闭包要一起重建（换后端不换清单 = "
+          "文档在描述一台作业已经不会去的机器）")
+
+
 def main() -> None:
     # 先判**源表**, 再判从它生成的文档: 规则表写错了, 报出来的应该是"顺序错了"这种
     # 具体诊断, 而不是下游某条 schema 对不上。反过来排的话, 一个坏规则会先撞在
     # schema 的断言上, 读的人得倒推三层才知道源头在哪。
+    check_backend_seam()
     check_rules_table()
     check_information_document()
     check_category_lookup()
@@ -2428,6 +3022,9 @@ def main() -> None:
     # 控制台排在数据面那几条之后：它读的是同一张表与同一个注册表，前面的用例刚把
     # "数据面怎么判"定型；这里判的是**谁有权改那张表**，前提必须是前一组已经成立。
     check_admin()
+    # 凭据的字母表紧跟管理面：它管的就是"谁能被收进来"，而那三处收口一个在控制台、
+    # 一个在配置节点、一个在 key 表自己的定义里。
+    check_credential_spelling()
     check_request_channels()
     check_request_ext_defaults()
     check_request_accelerator()
@@ -2440,12 +3037,20 @@ def main() -> None:
     check_output_urls()
     check_server_surface()
     check_routes()
+    # 服务模式排在最后：它会把后端换成 http 再换回来，前面那些用例判的是插件模式
+    # （也是出厂默认）那颗后端的行为，不该被这一组的进出影响。
+    check_service_mode()
+    # 这一条排在服务模式旁边，因为它是服务模式的**前提**：包都 import 不起来，后面
+    # 那些"两种模式说同一件事"的判据就只是一句空话。它自己另起进程跑，与前面的
+    # 用例互不干扰。
+    check_standalone_import()
 
     document = document_of()
     # ``rules`` 是**每个类别**一条（同一个规则的类别共用一条规则串），所以这里两个数都报：
     # 只报类别数会让人以为规则数跟着类别数走，而这正是本轮要拆开的两件事。
     rule_kinds = sorted({str(entry["rule"]) for entry in document["rules"]})
     voices = document["speech"]["abilities"][0]["voices"]
+    service = cli.plan()
     print(f"test_spec.py: ok ({len(rule_kinds)} 条规则 {rule_kinds},"
           f"{len(document['rules'])} 个类别,"
           f"{len(document['abilities'])} 条能力,"
@@ -2454,6 +3059,7 @@ def main() -> None:
           f"语音 {document['speech']['rules'][0]['rule']} 带 {len(voices)} 个音色,"
           f"{len(document['endpoints'])} 个 endpoint,"
           f"{translate.memory_size()} 条翻译记忆,"
+          f"服务模式 {service['host']}:{service['port']} → {service['upstream']},"
           f"插件 {document['plugin']['id']} {document['plugin']['version']},"
           f"根 {server.API_ROOT}, 契约 {document['spec']})")
 

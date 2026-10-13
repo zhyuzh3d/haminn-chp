@@ -481,6 +481,34 @@ hamdraw_chp/backends/comfy_http.py   服务模式的上游后端
 **上游地址只在部署侧配置**（§6），**永不许来自请求体** —— 否则一个 key 就变成「拿你的钥匙打任意地址」。
 这条与 `translate.url` 同规。
 
+**服务模式的六个实现决定**（S5 落地时定，写在这里免得以后被"顺手简化"）：
+
+1. **要问上游的三件事是 `async`**（`queue` / `history` / `output_path`），在进程内并不需要
+   `await`。两种模式的**形状必须一样**，否则协议层就得知道自己挂在哪个后端上 ——
+   而这个接缝存在的全部理由就是让它不必知道。
+2. **两种模式共用的那半只有一份代码**（`backends/records.py`：状态机、队列位置、
+   历史记录里的产物、一个类别的模型文件解析）。分两份的话，判据①的"逐字节相同"迟早只是巧合。
+3. **模型清单是快照，不是每次现问**（`comfy_http.refresh()` + `available`/`absent` 读快照）。
+   词表里那两个是同步函数，而且这样 `/chp/info` **永远不等上游** —— 上游慢或不在时，
+   文档照样是即时答复。服务模式多一个错误码 `no_upstream`（409）：上游不在是**这个模式
+   独有**的一种故障，把它说成 `no_model` 会把人指到错的配置文件上。
+4. **参考图先落在本机暂存目录，提交时上传**（`POST /upload/image`），并按**上游答的那个
+   名字**改写图里那一格；产物反向取回（`GET /view`）再交给 `FileResponse`。服务模式
+   与上游**不假设共享文件系统** —— 假设共享是那种"本机测得通、换台机器就废"的设计。
+   （作业号也因此由本服务自己发，见上表；映射在内存里，所以进程重启前提交的作业
+   只能回 `not_found`，与"从来不存在的号"同一个答案。）
+5. **后端由"启动它的那一个"点名，`import` 时谁都不绑**（`__init__.py` 点 inproc、
+   `cli.main()` 点 http）。这不只是风格：进程内后端**就是** import ComfyUI 的那一半，
+   绑定写在 import 时，`python -m hamdraw_chp serve` 就在"没有 ComfyUI 的机器"上连
+   import 都过不去 —— 而那种机器正是这个入口唯一的理由。实测踩过：`server.py` 里一句
+   `backend = backends.get()` 就够让 `serve` 起不来，而离线自检（替身齐全）全绿。
+6. **路由表两种形状，在一处合一**（`server._bind`）：ComfyUI 交给插件的是
+   `RouteTableDef`（`table.get(path)` **返回一个装饰器**），服务模式挂的是活的
+   `web.Application().router`（`add_get(path, handler)`，返回 `None`）。这是本轮**唯一**
+   被替身藏住的真缺陷：离线自检的假路由表按前一种形状造的，于是"服务模式第一行路由就
+   `TypeError`"在自检里是绿的。判据因此改成两种形状**各留一个替身**、各自都要挂上。
+
+
 **判据（三条，一条比一条硬）**：
 
 1. 服务模式下，同一个 key 的 `/chp/info` 与插件模式**逐字节相同**（`endpoints` 是**相对路径**，
@@ -836,7 +864,7 @@ ComfyUI and puts that machine's local models behind one interface. Get it from t
     "timeout": 60.0
   },
 
-  "serve": { "host": "127.0.0.1", "port": 8889 }
+  "serve": { "host": "127.0.0.1", "port": 8889, "upstream": "http://127.0.0.1:8188" }
 }
 ```
 
@@ -846,7 +874,7 @@ ComfyUI and puts that machine's local models behind one interface. Get it from t
 | 必要（引擎要） | `speech.token` | 引擎回 401 ⇒ 同样收敛成 `no_engine` |
 | 有可用默认 | `speech.voices` / `sample_rate` / `timeout` | 用出厂值照跑；`voices` 是**这台机器上引擎支持的名字**，换引擎才要改 |
 | 只用于播报 | `speech.engine` | 只进 `files.engine`，不影响跑 |
-| **仅服务模式** | `serve.host` / `serve.port` | 用默认 `127.0.0.1:8889`；**插件模式忽略它**（绑定由 ComfyUI 决定） |
+| **仅服务模式** | `serve.host` / `serve.port` / **`serve.upstream`** | 用默认 `127.0.0.1:8889`；**插件模式忽略这一档**（绑定由 ComfyUI 决定） |
 
 环境变量照 `HAMDRAW_*` 的既有拼法加：`HAMDRAW_SPEECH_URL`、`HAMDRAW_SPEECH_TOKEN`。
 （既有先例：`settings.py:229 translate()` 的形状是 `url = env(HAMDRAW_TRANSLATE_URL) or stored["url"]`
@@ -859,6 +887,13 @@ ComfyUI and puts that machine's local models behind one interface. Get it from t
 | **数据面 key** | happ ↔ CHP | `chp_keys.json`（+ 默认 key 来自配置节点 / `HAMDRAW_PASSWORD`） |
 | **控制台凭据** | 管理员 ↔ 控制台 | `chp_admin.json`（**只能本机改**） |
 | **引擎令牌** | CHP ↔ TTS 引擎 | `hamdraw_settings.json` 的 `speech.token`（**永不进文档、永不进响应**） |
+
+**凭据的字母表 = 英文大小写字母、数字、`-`、`_`**（业主 2026-10-13 定，中文不必支持）。
+规矩卡在**收进来那一刻**（`keys.ALPHABET` + 控制台建 key + 配置节点那格密码），
+而不是在比对时替非 ASCII 绕路 —— `hmac.compare_digest` 遇到非 ASCII 的 `str` 会抛，
+所以那种"支持"以前是拿一条 500 换来的。**送上来的**那一串不受这条规矩管：不匹配就是
+一句 `401`（比对照旧按字节走）。`chp_admin.json` 是运维自己写的文件，**读它的时候不拦**
+—— 拦了就是把自己锁在门外。
 
 **管理面与数据面不许共用同一把钥匙** —— 数据面 key 泄漏 = 白用模型；若还能进控制台，就是**能改授权、能给自己造 key = 接管**。
 

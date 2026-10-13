@@ -24,6 +24,7 @@ import folder_paths
 import nodes
 
 from . import capabilities as capabilities_module
+from . import keys as keys_module
 from . import settings as settings_module
 from .families.qwen_image import sigma_text
 
@@ -145,6 +146,14 @@ class HamDrawConfig:
         qwen_vae: str | None = None,
         **accelerators: Any,
     ) -> tuple[str]:
+        # 密码就是**默认那把数据面钥匙**，所以它服从同一个字母表（`keys.ALPHABET`：
+        # 英文大小写字母、数字、`-`、`_`）。**空着的照旧是"关掉鉴权"**（这是文档里
+        # 明说的用法），所以只拦非空的。拒的是 Queue 这一次，什么都不写 —— 把不认得的
+        # 密码悄悄存下来，或者更糟的"存成空 = 顺带关掉鉴权"，都是不能接受的那种安静。
+        if password and not keys_module.spelling_ok(password):
+            raise ValueError(
+                "密码只认英文大小写字母、数字、- 和 _（不支持中文）。"
+                "请改掉再 Queue；想关掉鉴权就把这一格留空。")
         patch: dict[str, Any] = {
             "password": str(password or ""),
             "checkpoints": {

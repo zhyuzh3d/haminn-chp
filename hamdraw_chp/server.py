@@ -1,4 +1,4 @@
-"""The CHP HTTP API — the reference implementation of ComfyUI Haminn Protocol.
+"""The CHP HTTP API — the reference implementation of Consolidated Haminn Portal.
 
 Three kinds of endpoint, and nothing else:
 
@@ -46,11 +46,26 @@ module.  Every question that can only be answered by the machine the models live
 on — which files are installed, what the queue holds, how a graph is validated
 and enqueued, where an output is on disk — goes through
 :mod:`hamdraw_chp.backends`, which is a module of functions with one screen of
-vocabulary.  The in-process backend is today's behaviour, moved verbatim; an
-HTTP backend is what will let ``python -m hamdraw_chp serve`` speak this same
+vocabulary.  The in-process backend is today's behaviour, moved verbatim; the
+HTTP backend is what lets ``python -m hamdraw_chp serve`` speak this same
 protocol on a machine where the plugin is not loaded.  Routes are registered
 *here*, not in the backend, because service mode attaches this same set of
 handlers to its own aiohttp app.
+
+**Both entries import this module**, so which backend is in use cannot be decided
+at import time: **each entry names its own** — ``__init__.py`` binds the
+in-process one (that process is ComfyUI), ``cli.main()`` calls :func:`use_backend`
+before it wires anything.  Nothing is bound here, and that is load-bearing rather
+than tidy: the in-process backend is the one that imports ComfyUI, so binding it
+at import time would leave ``python -m hamdraw_chp serve`` unable to start on
+exactly the machines that entry exists for.  Nothing else may switch it — the two
+modes are the same protocol, and the moment this layer starts branching on which
+one it is, they are not.
+
+Everything whose answer has to be asked of the *running* ComfyUI is ``async``,
+including the three that need no ``await`` in-process (``queue``, ``history``,
+``output_path``): over HTTP they are requests, and a vocabulary whose shape
+changed with the backend would leak the backend into this layer.
 
 Authentication
 --------------
@@ -171,10 +186,16 @@ from .version import __version__
 API_ROOT = capabilities_module.API_ROOT
 INPUT_SUBFOLDER = "hamdraw"
 
-#: The one backend this process uses.  Chosen by whoever started it, never
-#: detected (§4.3 of the portal plan): the plugin gets the in-process one, and
-#: ``serve`` will ask for the HTTP one by name.
-backend = backends.get()
+#: The one backend this process uses.  **Not chosen here** — chosen by whoever
+#: started the process, with :func:`use_backend` (§4.3 —— 模式由「谁启动它」决定，
+#: 不做自动探测)：``__init__.py`` binds the in-process one (this is the plugin) and
+#: ``cli.main()`` binds the HTTP one (this is the service).
+#:
+#: It is deliberately left unbound at import time, and that is not tidiness: the
+#: in-process backend is the one that imports ComfyUI, so binding it here would
+#: make ``python -m hamdraw_chp serve`` **unable to start on a machine without
+#: ComfyUI** — which is the only machine that entry point exists for.
+backend: Any = None
 
 MAX_BODY_BYTES = 32 * 1024 * 1024
 MAX_TRACKED_JOBS = 256
@@ -208,6 +229,9 @@ ERROR_STATUS = {
     "forbidden_capability": 403,
     "unsupported_voice": 400,
     "no_model": 409,
+    # 服务模式独有: 它自己不跑模型, 所以"那台跑模型的机器不在"是一件能发生的事。
+    # 码本身定义在 ``capabilities`` 里 —— 后端要判定它, 这里要回它, 一个字面量两处用。
+    capabilities_module.NO_UPSTREAM: 409,
     "no_engine": 409,
     "speech_failed": 502,
     "busy": 429,
@@ -231,6 +255,8 @@ ERROR_MESSAGES = {
     "no_engine": "没有可用的语音引擎，请先在 CHP 配置里填好语音服务地址。",
     "speech_failed": "语音引擎没有正常应答。",
     "no_model": "没有可用的模型，请先在 CHP 插件配置节点里选好这个场景要用的模型。",
+    capabilities_module.NO_UPSTREAM:
+        "服务模式连不上上游 ComfyUI：请核对配置里的 serve.upstream，以及那台机器是否正在运行。",
     "busy": "队列已满，请稍后再试。",
     "duplicate_request": "这个 request_id 已经用过了：重发同一次提交请沿用同一个 request_id，换一份内容请换一个 request_id。",
     "not_found": "找不到这个任务。",
@@ -406,10 +432,31 @@ def _configured_models(category: str) -> dict[str, str]:
     return _model_files(str(category))
 
 
-#: The model-listing callable the discovery document uses, built once.  The
-#: backend answers "are they installed"; :func:`_configured_models` answers
-#: "which names did the operator write".
-_abilities_of = backend.abilities(_configured_models)
+#: The model-listing callable the discovery document uses, built once **per
+#: backend**: the backend answers "are they installed", :func:`_configured_models`
+#: answers "which names did the operator write".  ``None`` until a launcher binds
+#: one — left as ``None`` it fails loudly the moment anything asks, which is what
+#: a process with no launcher deserves.
+_abilities_of: Any = None
+
+
+def use_backend(name: str) -> Any:
+    """Point this process at one backend — **the launcher's single call**.
+
+    It exists because both entries import this module: ``import hamdraw_chp`` is
+    the plugin and has already run by the time ``python -m hamdraw_chp serve``
+    gets a line of its own.  The mode therefore cannot be decided at import time;
+    it is decided by the first thing the launcher does, and this is that thing
+    (§4.3 —— 模式由「谁启动它」决定，不做自动探测).
+
+    The listing callable is rebuilt here too, because it is a closure over the
+    backend.  Leaving the old one behind is precisely the bug this seam exists to
+    prevent: a document describing a machine the jobs no longer go to.
+    """
+    global backend, _abilities_of
+    backend = backends.get(name)
+    _abilities_of = backend.abilities(_configured_models)
+    return backend
 
 
 def _accelerator(category: str) -> dict[str, Any]:
@@ -717,12 +764,21 @@ def _resolve_models(category: str) -> tuple[dict[str, str], web.Response | None]
     decided that separately the two could disagree, and a client configured from
     the document would be refused anyway — the one failure mode a discovery
     document exists to prevent.  One decision point, so they cannot.
+
+    A backend may add a ``reason`` to a not-ready verdict, and it wins over
+    ``no_model``: "you have not picked a model" and "the machine that runs models
+    is not answering" are different sentences for different people, and a service
+    that reports the first when the second is true sends its operator to the
+    wrong file.
     """
     resolved = _abilities_of(category)
     if resolved["ready"]:
         return resolved["files"], None
     role = str(resolved["missing"][0])
     folder = capabilities_module.ROLE_FOLDERS.get(role, role)
+    reason = str(resolved.get("reason") or "")
+    if reason:
+        return {}, _fail(reason, detail={"category": category, "folder": folder})
     name = str(resolved["files"].get(role) or "").strip()
     return {}, _no_model(category, folder, name)
 
@@ -764,9 +820,9 @@ async def create_job(request: web.Request) -> web.Response:
         if decision == "replay":
             # 重放答的是**同一个作业的此刻**，不是第一次那个 202 的复印件：客户端
             # 之所以重发，正因为上次没收到回音，而那张图很可能早就好了。
-            running, pending = backend.queue()
+            running, pending = await backend.queue()
             return _json({"job": _describe(subject, running, pending,
-                                          backend.history(str(subject["id"]))),
+                                          await backend.history(str(subject["id"]))),
                           "replayed": True}, status=202)
 
     try:
@@ -838,7 +894,7 @@ async def create_job(request: web.Request) -> web.Response:
         if refused is not None:
             return refused
 
-        running, pending = backend.queue()
+        running, pending = await backend.queue()
         if len(pending) >= MAX_PENDING_JOBS:
             return _fail("busy", detail={"pending": len(pending)})
 
@@ -936,7 +992,7 @@ async def job_status(request: web.Request) -> web.Response:
         return _unauthorized()
     job_id = str(request.match_info.get("job_id") or "").strip()
     job = _tracked(job_id)
-    entry = backend.history(job_id)
+    entry = await backend.history(job_id)
     if job is None:
         if entry is None:
             return _fail("not_found")
@@ -944,7 +1000,7 @@ async def job_status(request: web.Request) -> web.Response:
         # ComfyUI's history still has the outputs, so the job is described from
         # an empty shell rather than reported missing.
         job = {"id": job_id, "category": "", "created": time.time(), "cancelled": False}
-    running, pending = backend.queue()
+    running, pending = await backend.queue()
     return _json({"job": _describe(job, running, pending, entry)})
 
 
@@ -961,8 +1017,8 @@ async def job_progress(request: web.Request) -> web.Response:
         return _unauthorized()
     job_id = str(request.match_info.get("job_id") or "").strip()
     job = _tracked(job_id)
-    entry = backend.history(job_id)
-    running, pending = backend.queue()
+    entry = await backend.history(job_id)
+    running, pending = await backend.queue()
     if job is None and entry is None and job_id not in running and job_id not in pending:
         return _fail("not_found")
     return _json({"job": _progress_payload(job_id, job, entry, running, pending)})
@@ -976,11 +1032,11 @@ async def job_output(request: web.Request) -> web.Response:
         index = int(str(request.match_info.get("index") or "0"))
     except (TypeError, ValueError):
         return _fail("bad_request")
-    files = backend.outputs(job_id, backend.history(job_id))
+    files = backend.outputs(job_id, await backend.history(job_id))
     if index < 0 or index >= len(files):
         return _fail("not_found")
     chosen = files[index]
-    path = backend.output_path(chosen["type"], chosen["subfolder"], chosen["filename"])
+    path = await backend.output_path(chosen["type"], chosen["subfolder"], chosen["filename"])
     if path is None:
         return _fail("not_found")
     response = web.FileResponse(path)
@@ -994,7 +1050,7 @@ async def cancel_job(request: web.Request) -> web.Response:
         return _unauthorized()
     job_id = str(request.match_info.get("job_id") or "").strip()
     job = _tracked(job_id)
-    running, pending = backend.queue()
+    running, pending = await backend.queue()
     if job is None and job_id not in running and job_id not in pending:
         return _fail("not_found")
     dropped = await backend.cancel(job_id, running, pending)
@@ -1005,8 +1061,8 @@ async def cancel_job(request: web.Request) -> web.Response:
         _track(job)
     if job is None:
         return _fail("not_found")
-    running, pending = backend.queue()
-    return _json({"job": _describe(job, running, pending, backend.history(job_id))})
+    running, pending = await backend.queue()
+    return _json({"job": _describe(job, running, pending, await backend.history(job_id))})
 
 
 async def translate_prompts(request: web.Request) -> web.Response:
@@ -1193,6 +1249,27 @@ async def admin_key_delete(request: web.Request) -> web.Response:
 # wiring
 # --------------------------------------------------------------------------- #
 
+def _bind(table: Any, method: str, path: str, handler: Any) -> None:
+    """Attach one handler to a route table — **two shapes, one meaning**.
+
+    ComfyUI hands the plugin an ``aiohttp.web.RouteTableDef``: ``table.get(path)``
+    **returns a decorator** to call with the handler, which is exactly how the
+    plugin has always written this.  Service mode attaches to a live
+    ``web.Application().router`` (an ``UrlDispatcher``), which takes both at once
+    as ``add_get(path, handler)`` and returns ``None``.
+
+    Both are aiohttp, so the difference is easy to miss — and it was: written the
+    first way, the service crashed with ``TypeError: 'NoneType' object is not
+    callable`` on its very first route.  The offline suite could not see it
+    because its fake router was built in ComfyUI's shape.  只差这一处，就在这里
+    合一 —— 路由表本身不该有第二份，否则"两种模式跑同一批 handler"只是巧合。
+    """
+    if hasattr(table, "add_" + method):
+        getattr(table, "add_" + method)(path, handler)
+    else:
+        getattr(table, method)(path)(handler)
+
+
 def register_routes(routes: Any = None) -> bool:
     """Attach the API to a running server; safe to call once at import.
 
@@ -1200,7 +1277,11 @@ def register_routes(routes: Any = None) -> bool:
     — and when it is not, it is asked of the backend, which answers ``None``
     outside ComfyUI.  ``False`` therefore means "there is nowhere to attach yet",
     not "this failed"; the caller decides whether that is worth a log line.
+    With no backend bound (``python -m hamdraw_chp serve`` before ``cli.main()``
+    has named one) the answer is the same ``False``, for the same reason.
     """
+    if backend is None:
+        return False
     if routes is None:
         routes = backend.routes()
     if routes is None:
@@ -1211,24 +1292,24 @@ def register_routes(routes: Any = None) -> bool:
     # ``/cvp`` could serve the same API; a client is now told to read its
     # addresses out of the document's ``endpoints``, so a second spelling of the
     # same thing is a promise this version deliberately stops making.
-    routes.get(f"{API_ROOT}/info")(info)
-    routes.post(f"{API_ROOT}/jobs")(create_job)
-    routes.get(f"{API_ROOT}/jobs/{{job_id}}")(job_status)
-    routes.get(f"{API_ROOT}/jobs/{{job_id}}/progress")(job_progress)
-    routes.get(f"{API_ROOT}/jobs/{{job_id}}/output/{{index}}")(job_output)
-    routes.post(f"{API_ROOT}/jobs/{{job_id}}/cancel")(cancel_job)
-    routes.post(f"{API_ROOT}/translate")(translate_prompts)
-    routes.post(f"{API_ROOT}/speech")(speech_endpoint)
+    _bind(routes, "get", f"{API_ROOT}/info", info)
+    _bind(routes, "post", f"{API_ROOT}/jobs", create_job)
+    _bind(routes, "get", f"{API_ROOT}/jobs/{{job_id}}", job_status)
+    _bind(routes, "get", f"{API_ROOT}/jobs/{{job_id}}/progress", job_progress)
+    _bind(routes, "get", f"{API_ROOT}/jobs/{{job_id}}/output/{{index}}", job_output)
+    _bind(routes, "post", f"{API_ROOT}/jobs/{{job_id}}/cancel", cancel_job)
+    _bind(routes, "post", f"{API_ROOT}/translate", translate_prompts)
+    _bind(routes, "post", f"{API_ROOT}/speech", speech_endpoint)
     # 控制台：同一个服务、同一个端口，**但不在 `endpoints` 里**（§4.9）。客户端只从
     # 文档读地址，所以它永远不知道这一族存在；契约因此保持干净。路径常量与那份清单
     # 都在 :mod:`hamdraw_chp.admin` 里 —— 清单是给测试比对用的，两边各写一次才对得上。
-    routes.get(admin_module.ADMIN_ROOT)(admin_page)
-    routes.get(admin_module.PAGE_PATH)(admin_page)
-    routes.get(admin_module.CAPABILITIES_PATH)(admin_capabilities)
-    routes.get(admin_module.KEYS_PATH)(admin_keys_list)
-    routes.post(admin_module.KEYS_PATH)(admin_keys_create)
-    routes.post(admin_module.KEY_PATH)(admin_key_update)
-    routes.delete(admin_module.KEY_PATH)(admin_key_delete)
+    _bind(routes, "get", admin_module.ADMIN_ROOT, admin_page)
+    _bind(routes, "get", admin_module.PAGE_PATH, admin_page)
+    _bind(routes, "get", admin_module.CAPABILITIES_PATH, admin_capabilities)
+    _bind(routes, "get", admin_module.KEYS_PATH, admin_keys_list)
+    _bind(routes, "post", admin_module.KEYS_PATH, admin_keys_create)
+    _bind(routes, "post", admin_module.KEY_PATH, admin_key_update)
+    _bind(routes, "delete", admin_module.KEY_PATH, admin_key_delete)
     return True
 
 

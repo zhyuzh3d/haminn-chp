@@ -50,9 +50,20 @@ API_ROOT = "/chp"
 #: 归本模块 —— ``server.py`` 从这里取，而不是各写一份。
 MAX_REQUEST_ID_CHARS = 200
 
+#: 上游 ComfyUI 不在时回的那个错误码。**它有两个读者** —— ``server.py`` 的错误表
+#: （谁回它、哪句话给人看）与 :mod:`hamdraw_chp.backends.comfy_http`（谁判定它）。
+#: 两处各写一份字面量迟早会漂，而漂掉的那一次是"文档列出了这个码、服务却回另一个"，
+#: 从外面完全看不出来 —— 与 :data:`MAX_REQUEST_ID_CHARS` 同一条理由。
+NO_UPSTREAM = "no_upstream"
+
 PLUGIN_ID = "hamdraw_chp"
-PLUGIN_LABEL = {"zh": "CHP 插件（ComfyUI Haminn Protocol）",
-                "en": "CHP plugin (ComfyUI Haminn Protocol)"}
+#: **CHP = Consolidated Haminn Portal**（中文「Haminn 综合入口程序」）—— 业主 2026-10-12 定名，
+#: 取代原来的「ComfyUI Haminn Protocol」。改名只改**自称**：根路径 / :data:`PLUGIN_ID` /
+#: 包名 / ``HAMDRAW_*`` / 设置文件名 / :data:`SPEC` 全都不动 —— 那些是已发布的标识，
+#: 不是产品名。装在 ComfyUI 里那个东西叫 **CHP 插件**，简称 **CHPCP**（CHP ComfyUI Plugin）；
+#: 所以这个 label 报的是插件自己的名字，不是协议的名字。
+PLUGIN_LABEL = {"zh": "CHP 插件（CHPCP）",
+                "en": "CHP plugin (CHPCP)"}
 
 #: The relative paths a client should use.  Given here so a client never has to
 #: assemble one itself — reading them is a rule, not a courtesy.
@@ -742,7 +753,7 @@ def document(*, files_of: Callable[[str], Any], authorized: bool, auth_required:
 
 __all__ = [
     "ABILITY_NAMES", "API_ROOT", "CATEGORY_TABLE", "ENDPOINTS", "FRAMES",
-    "INPUT_SCHEMAS", "MAX_REQUEST_ID_CHARS", "PLUGIN_ID", "PLUGIN_LABEL",
+    "INPUT_SCHEMAS", "MAX_REQUEST_ID_CHARS", "NO_UPSTREAM", "PLUGIN_ID", "PLUGIN_LABEL",
     "REF_STRENGTH_RANGE", "ROLE_FOLDERS", "RULES", "SPEC", "abilities",
     "accepts_image", "categories", "category_of", "check_frames",
     "clamp_ref_strength", "clean_defaults", "default_ref_strength",

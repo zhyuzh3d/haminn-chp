@@ -13,6 +13,11 @@ Resolution order for the password:
 Nothing here may carry a default that only fits one machine.  A translation
 backend address, a cache dtype chosen for a memory-starved box, a model file name
 — all of those are deployment decisions and all of them default to "unset".
+The ``serve`` block is the one exception, and a narrow one: ``python -m
+hamdraw_chp serve`` cannot start at all without a bind address and an upstream,
+and its defaults (loopback, an unprivileged port, ComfyUI's own default address)
+describe no particular machine — they are the "somebody has to say otherwise"
+values, not one box's arrangement.
 """
 
 from __future__ import annotations
@@ -77,6 +82,18 @@ DEFAULT_SPEECH_ENGINE = "qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf"
 #: 引擎固定 24 kHz 单声道（实测）。这里是默认值, 文档里播报的是这个数。
 DEFAULT_SAMPLE_RATE = 24000
 
+#: 服务模式（``python -m hamdraw_chp serve``）自己绑在哪儿 —— **插件模式忽略这一档**
+#: （那时绑定由 ComfyUI 决定）。默认只听本机: 一个不知道会不会被暴露到局域网的服务,
+#: 默认不该听 ``0.0.0.0``; 要暴露是一个决定, 得有人写下来。
+DEFAULT_SERVE_HOST = "127.0.0.1"
+DEFAULT_SERVE_PORT = 8889
+SERVE_PORT_RANGE = (1, 65535)
+
+#: 上游 ComfyUI 在哪。服务模式不跑模型, 所以它**必须**知道这件事, 这是本档里唯一
+#: 带默认值的一项（默认就是 ComfyUI 自己的端口）。它与 ``translate.url`` / ``speech.url``
+#: 同规: 只从部署侧来, **永不许来自请求体** —— 否则一把 key 就变成「拿你的钥匙打任意地址」。
+DEFAULT_UPSTREAM = "http://127.0.0.1:8188"
+
 #: 音频引擎自己那一档的超时。**首字节是慢的那一半**（引擎首次请求要加载模型），
 #: 所以它比翻译那档宽得多。
 DEFAULT_SPEECH_TIMEOUT = 60.0
@@ -140,6 +157,14 @@ DEFAULTS: dict[str, Any] = {
         "sample_rate": DEFAULT_SAMPLE_RATE,
         "timeout": DEFAULT_SPEECH_TIMEOUT,
     },
+    # 服务模式: 三个值全是「这台机器怎么起」的部署事实, 所以都在这里, 不在环境变量里
+    # （``serve.host``/``port`` 也不是密钥, 没有理由藏进环境）。``upstream`` 是唯一
+    # 一个有默认值的 —— 服务模式没有它有活干不了, 而 ComfyUI 的默认端口是共识。
+    "serve": {
+        "host": DEFAULT_SERVE_HOST,
+        "port": DEFAULT_SERVE_PORT,
+        "upstream": DEFAULT_UPSTREAM,
+    },
 }
 
 _LOCK = threading.RLock()
@@ -165,6 +190,24 @@ def _number(value: Any, fallback: float, limits: tuple[float, float]) -> float:
         return fallback
     low, high = limits
     return min(max(float(value), low), high)
+
+
+def _port(value: Any, fallback: int) -> int:
+    """一个端口号: 数字与数字串都收, 夹进合法区间, 读不出来才退回默认。
+
+    按字符串收是有理由的, 不是为了宽厚: ``serve`` 那一档是**手写**进
+    ``hamdraw_settings.json`` 的（配置节点上没有它）—— 手写的人写 ``"9911"``
+    很常见, 而"写了却没生效"正是这份文件最不该有的一种失败: 改端口的人会盯着
+    一个没变的端口找半天。
+    """
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, str):
+        try:
+            value = int(value.strip())
+        except ValueError:
+            return fallback
+    return int(_number(value, fallback, SERVE_PORT_RANGE))
 
 
 def _merge(base: dict[str, Any], stored: dict[str, Any]) -> dict[str, Any]:
@@ -256,6 +299,16 @@ def _merge(base: dict[str, Any], stored: dict[str, Any]) -> dict[str, Any]:
             speech.get("sample_rate"), base["speech"]["sample_rate"], SPEECH_SAMPLE_RATE_RANGE))
         base["speech"]["timeout"] = _number(
             speech.get("timeout"), base["speech"]["timeout"], SPEECH_TIMEOUT_RANGE)
+
+    serve = stored.get("serve")
+    if isinstance(serve, dict):
+        value = serve.get("host")
+        if isinstance(value, str) and value.strip():
+            base["serve"]["host"] = value.strip()
+        base["serve"]["port"] = _port(serve.get("port"), base["serve"]["port"])
+        value = serve.get("upstream")
+        if isinstance(value, str) and value.strip():
+            base["serve"]["upstream"] = value.strip().rstrip("/")
     return base
 
 
@@ -319,6 +372,27 @@ def speech() -> dict[str, Any]:
         "sample_rate": int(_number(stored["sample_rate"], DEFAULT_SAMPLE_RATE,
                                    SPEECH_SAMPLE_RATE_RANGE)),
         "timeout": _number(stored["timeout"], DEFAULT_SPEECH_TIMEOUT, SPEECH_TIMEOUT_RANGE),
+    }
+
+
+def serve() -> dict[str, Any]:
+    """Where the service listens, and which ComfyUI it talks to.
+
+    Both facts come from the deployment side and from nowhere else: the bind
+    address is decided by whoever started the process, and the upstream address
+    is a setting — never a request field (§4.3).  A key that could name the
+    upstream would be a key that turns CHP into a proxy for any address, which is
+    the same rule ``translate.url`` and ``speech.url`` already follow.
+
+    Defaults exist because a service nobody can start without editing a file is a
+    service nobody starts.  ``host`` defaults to the loopback address, so putting
+    it on a LAN is a decision rather than an accident.
+    """
+    stored = load()["serve"]
+    return {
+        "host": str(stored["host"]).strip() or DEFAULT_SERVE_HOST,
+        "port": _port(stored["port"], DEFAULT_SERVE_PORT),
+        "upstream": str(stored["upstream"]).strip().rstrip("/") or DEFAULT_UPSTREAM,
     }
 
 

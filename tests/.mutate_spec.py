@@ -33,6 +33,21 @@ SPEECH = "hamdraw_chp/speech.py"
 ADMIN = "hamdraw_chp/admin.py"
 ADMIN_PAGE = "hamdraw_chp/admin.html"
 
+#: 服务模式（S5）。**两个后端共用那一半**（``records.py``）也在名单里 —— 它是
+#: 「两种模式同一个回答」的落点，正是最该被盯着别分叉的一份代码。
+COM_HTTP = "hamdraw_chp/backends/comfy_http.py"
+RECORDS = "hamdraw_chp/backends/records.py"
+CLI = "hamdraw_chp/cli.py"
+
+#: 服务模式的**前提**：这个包得能在没有 ComfyUI 的机器上 import 起来（``serve``
+#: 唯一的理由就是那种机器）。这条路上有两处代码在判断"这里没有 ComfyUI"：
+#: 包入口 ``__init__.py`` 与 ``server.py`` 的后端绑定。
+INIT = "hamdraw_chp/__init__.py"
+
+#: 凭据的字母表（业主 2026-10-13 定：字母、数字、``-``、``_``）横跨三处 ——
+#: 定义在 ``keys.py``，两个收口在控制台与配置节点。三处都要有一条变异。
+NODES = "hamdraw_chp/nodes.py"
+
 #: 变异会把某一处改坏, 而"改坏"的一种样子就是让某条路径变成死等。没有上限的话
 #: 一次死等就把整个脚本拖住, 读的人分不清"它在跑"和"它卡住了"。
 RUN_TIMEOUT_SECONDS = 60
@@ -292,11 +307,33 @@ MUTATIONS = [
         "该报 unsupported_steps",
     ),
     (
+        # S5 之后「输出地址由谁拼」这条判据住在**两个后端共用**的那份里
+        # （``backends/records.py``）—— 它必须只有一处，否则两种模式迟早走样。
         "输出地址不再由 API_ROOT 拼（客户端拿到的路径和文档公布的不是同一条）",
-        INPROC,
-        '"url": f"{capabilities_module.API_ROOT}/jobs/{prompt_id}/output/{len(files)}",',
-        '"url": f"/cvp/jobs/{prompt_id}/output/{len(files)}",',
+        RECORDS,
+        '"url": f"{capabilities_module.API_ROOT}/jobs/{job_id}/output/{len(files)}",',
+        '"url": f"/cvp/jobs/{job_id}/output/{len(files)}",',
         "输出地址必须由 API_ROOT 拼出",
+    ),
+    (
+        # 只换 backend 不换那个清单闭包 = 文档在描述一台作业已经不会去的机器。
+        # 判据在 S5 的「让两边真的不一致」那一段里：上游装着而本机没有的那个模型。
+        # 同一个洞有两半，各一条变异：**没有**那个闭包（认领在 main() 最前面那条），
+        # 与闭包**重建成了另一台机器**的清单（认领在 S5 那段"让两边真的不一致"）。
+        "换了后端却没换「清单从哪来」（闭包干脆没建）",
+        SERVER,
+        '    backend = backends.get(name)\n    _abilities_of = backend.abilities(_configured_models)\n    return backend',
+        '    backend = backends.get(name)\n    return backend',
+        "点名后端时那个「清单从哪来」的闭包要一起重建",
+    ),
+    (
+        "闭包重建成了另一台机器的清单（文档在描述作业不会去的那台）",
+        SERVER,
+        '    backend = backends.get(name)\n    _abilities_of = backend.abilities(_configured_models)\n    return backend',
+        '    backend = backends.get(name)\n'
+        '    _abilities_of = backends.get(backends.DEFAULT).abilities(_configured_models)\n'
+        '    return backend',
+        "服务模式按上游的清单判",
     ),
     # --- 文档骨架与正名 -------------------------------------------------- #
     (
@@ -332,7 +369,7 @@ MUTATIONS = [
         "重放照抄第一次那份（不读此刻的状态）",
         SERVER,
         '            return _json({"job": _describe(subject, running, pending,\n'
-        '                                          backend.history(str(subject["id"]))),\n'
+        '                                          await backend.history(str(subject["id"]))),\n'
         '                          "replayed": True}, status=202)',
         '            return _json({"job": _describe(subject, running, pending, None),\n'
         '                          "replayed": True}, status=202)',
@@ -796,6 +833,223 @@ MUTATIONS = [
         '    return [*capabilities_module.categories(), speech_module.CATEGORY]',
         '    return list(capabilities_module.categories())',
         "图片侧五个 + speak",
+    ),
+    # --- 服务模式（S5） --------------------------------------------------- #
+    (
+        # 「问不到」与「不敢判」在插件模式里是同一件事（都在本机磁盘上），在服务
+        # 模式里**不是**：问不到上游就是一台机器不在，那种状态下不能让作业过。
+        "上游不在也当成「不敢判」（文档说一切都好，提交才失败）",
+        COM_HTTP,
+        '    if _LISTING is None:\n        return True',
+        '    if False:\n        return True',
+        "上游不在时一条能力都不许是 ready",
+    ),
+    (
+        # 一个答非所问的 object_info 会被当成"它一件模型都没有" —— 那就是把一次
+        # 通信故障说成了别人的配置问题。
+        "上游答非所问也算答上了",
+        COM_HTTP,
+        '    if not isinstance(info, dict):\n        return None',
+        '    if not isinstance(info, dict):\n        return {}',
+        # ⚠ 抓它的**不是**上面那条"问不到上游"（那次是连接失败，跟这里无关），
+        #   而是末尾那条"答非所问的清单不算答上了" —— 期望写错就会报成 ESCAPED。
+        "答非所问的清单不算答上了",
+    ),
+    (
+        # 反过来的一半：真答了"我这里什么都没有"必须算答上了，否则一个空实例
+        # 会被永远当成"上游不在"，而运维怎么查都是对的。
+        "上游答了「我一件都没有」却被当成没答",
+        COM_HTTP,
+        '    return folders\n\n\nasync def refresh',
+        '    return folders or None\n\n\nasync def refresh',
+        "问到了但一件都没有, 那是答上了",
+    ),
+    (
+        "不告诉调用方为什么一个都跑不了（服务模式下的 ready:false 变成了哑的）",
+        COM_HTTP,
+        '        if not resolved["ready"] and _LISTING is None:\n'
+        '            resolved["reason"] = capabilities_module.NO_UPSTREAM\n',
+        "",
+        "上游不在时提交要回 no_upstream",
+    ),
+    (
+        "读了 reason 却不用（还是报「你没配模型」）",
+        SERVER,
+        '    if reason:\n        return {}, _fail(reason, detail={"category": category, "folder": folder})\n',
+        '    if False:\n        return {}, _fail(reason, detail={"category": category, "folder": folder})\n',
+        "上游不在时提交要回 no_upstream",
+    ),
+    (
+        # 码在表里才有那句话与那个状态码；少了它，_fail 会退回 400 bad_request，
+        # 于是"上游不在"变成"你的请求写错了"。
+        "上游不在那个码不在错误表里",
+        SERVER,
+        '    capabilities_module.NO_UPSTREAM: 409,\n',
+        "",
+        "no_upstream 的状态码要是 409",
+    ),
+    (
+        "文档不再播报错误码集合（客户端只好自己抄一份）",
+        SERVER,
+        '            errors=sorted(ERROR_STATUS),\n',
+        '            errors=[],\n',
+        "文档的 errors 里要有那个码",
+    ),
+    (
+        # 用上游的 prompt_id 当自己的作业号 ⇒ 换一台上游就能撞上别人的号，
+        # 而且"这个号是谁的"再也说不清（计划 §4.3 要的正是发自己的号）。
+        "服务模式直接拿上游的 prompt_id 当作业号",
+        COM_HTTP,
+        '    job_id = str(uuid.uuid4())\n',
+        '    job_id = str(prompt_id)\n',
+        "服务模式要发自己的作业号",
+    ),
+    (
+        "参考图不传给上游（图里指着一个上游没有的文件）",
+        COM_HTTP,
+        '    for inputs, image in _loaders(graph):\n        await _offer_reference(inputs, image)',
+        '    for inputs, image in []:\n        await _offer_reference(inputs, image)',
+        "图里那一格要改成上游答的名字",
+    ),
+    (
+        "按我们发过去的名字改写，不问上游它把文件放哪了",
+        COM_HTTP,
+        '    inputs["image"] = f"{subfolder}/{uploaded}" if subfolder else uploaded\n',
+        '    inputs["image"] = f"{INPUT_SUBFOLDER}/{name}"\n',
+        "图里那一格要改成上游答的名字",
+    ),
+    (
+        # 上游清单的节点名写错 ⇒ 一个模型都读不出来，文档说"上游什么都没有"。
+        # 这类错只有对着**写死的**那份 object_info 才照得出来。
+        # ⚠ 不能指望"逐字节相同"抓它: 读不出东西时那一格是"上游没这个节点 = 不敢判
+        #   = 不缺"，于是文档照样 ready、两份照样一样 —— 必须打在"读出来了什么"上。
+        "上游清单的节点名写错（一个模型都读不出来）",
+        COM_HTTP,
+        '    "checkpoints": ("CheckpointLoaderSimple", "ckpt_name"),',
+        '    "checkpoints": ("CheckpointLoader", "ckpt_name"),',
+        "上游答的那几个 checkpoint 名字要能读出来",
+    ),
+    (
+        # 别人的作业混进我们的队列 ⇒ queue_position 变成"别人的号码"，
+        # 而那个数会被当真地显示给用户。
+        "不是这台服务交的作业也出现在队列里",
+        COM_HTTP,
+        '        if job_id:\n            found.append(job_id)',
+        '        found.append(job_id)',
+        "不是这台服务交的作业不许冒充成我们的",
+    ),
+    (
+        "服务模式把端口写死（改配置不生效）",
+        CLI,
+        '        "port": serve["port"],',
+        '        "port": 8889,',
+        "改了配置就要生效",
+    ),
+    (
+        "端口读了却不去绑它",
+        CLI,
+        '    site = web.TCPSite(runner, host, port)',
+        '    site = web.TCPSite(runner, "127.0.0.1", 8889)',
+        "绑定的必须是配置里那个地址",
+    ),
+    (
+        "服务模式的 app 不带请求体上限（大 body 直接进内存）",
+        CLI,
+        '    application = web.Application(client_max_size=server.MAX_BODY_BYTES)',
+        '    application = web.Application()',
+        "服务模式的 app 要把请求体上限带上",
+    ),
+    (
+        "端口不夹进合法区间（0 会被当成「随便挑一个」）",
+        SETTINGS,
+        'SERVE_PORT_RANGE = (1, 65535)',
+        'SERVE_PORT_RANGE = (0, 65535)',
+        "端口 0 要被夹进合法区间",
+    ),
+    (
+        # 斜杠是**两处**都在去（写文件那一侧 `_merge`、读出来那一侧 `serve()`），
+        # 所以只断言 `serve()` 的话这条变异是等价的 —— 抓它的那条断言读的是
+        # 另一个公开读者（`load()`）：手写进文件的那一份本身就该是干净的。
+        "上游地址尾部的斜杠不去（拼出来是双斜杠）",
+        SETTINGS,
+        '            base["serve"]["upstream"] = value.strip().rstrip("/")',
+        '            base["serve"]["upstream"] = value.strip()',
+        "上游地址尾部的斜杠要去掉",
+    ),
+    # --- 服务模式的前提：没有 ComfyUI 也要能 import -------------------------- #
+    (
+        # 这一条是**原来那行代码**：`server.py` 在 import 时就把进程内那个后端绑上，
+        # 而只有它 import ComfyUI。于是 `python -m hamdraw_chp serve` 在"没有 ComfyUI
+        # 的机器"上连 import 都过不去 —— 而那种机器正是这个入口唯一的理由。
+        "后端在 import 时就选定（服务模式在没有 ComfyUI 的机器上起不来）",
+        SERVER,
+        "backend: Any = None",
+        "backend: Any = backends.get()",
+        "没有 ComfyUI 也要能 import",
+    ),
+    (
+        # 后端没绑上时 `register_routes` 不许伸手去问它。
+        "没绑后端时仍然去问后端要路由表",
+        SERVER,
+        '    if backend is None:\n        return False\n',
+        "",
+        "没有 ComfyUI 也要能 import",
+    ),
+    (
+        # 「放过 ComfyUI 不在」与「放过所有 import 错误」只差一个字 —— 后者会把
+        # "这包坏了"说成"这里没有 ComfyUI"，读的人就去错的地方找了；更要紧的是，
+        # 插件会在 ComfyUI 里静悄悄地一个人都不注册。
+        "把「没有 ComfyUI」的宽厚扩大到所有 import 错误",
+        INIT,
+        '    return str(error.name or "") in COMFYUI_MODULES',
+        "    return True",
+        "应当判成 「这包坏了」",
+    ),
+    (
+        # 两种路由表只差一处写法：插件那份是 RouteTableDef（`get(path)` 返回装饰器），
+        # 服务那份是活的 UrlDispatcher（`add_get(path, handler)`）。写死成前者，
+        # 服务模式第一行路由就炸 —— 实测炸过一次，而当时的替身正是**这个形状**。
+        "路由只按 ComfyUI 那种表挂（服务模式第一行就炸）",
+        SERVER,
+        '    if hasattr(table, "add_" + method):',
+        "    if False:",
+        "服务模式要把同一批路由挂到自己的 app 上",
+    ),
+    (
+        # 反过来：写死成服务那种表，插件那一半一条路由都挂不上。
+        # ⚠ 抓它的**不是**某条 `check(...)` —— 插件那一半是在 `import hamdraw_chp`
+        #   时登记路由的（ComfyUI 就这么读它），所以这一条一改，测试进程连 import
+        #   都过不去，没机会走到任何断言。证据因此是那句 AttributeError：替身按
+        #   ComfyUI 的形状造（`get(path)` 返回装饰器），**根本没有 `add_get`**。
+        #   这也正是判据本身 —— 一条只认 aiohttp dispatcher 的 `_bind` 挂不上插件。
+        "路由只按 aiohttp 那种表挂（插件那一半一条都挂不上）",
+        SERVER,
+        '    if hasattr(table, "add_" + method):',
+        "    if True:",
+        "object has no attribute 'add_get'",
+    ),
+    # --- 凭据的字母表：字母、数字、- 和 _ ----------------------------------- #
+    (
+        # 这是那条规矩的**唯一定义**。放松它，两个收口就都成了摆设。
+        "凭据字母表放松成「什么字符都收」",
+        KEYS,
+        'ALPHABET = re.compile(r"[A-Za-z0-9_-]+")',
+        'ALPHABET = re.compile(r".+")',
+        "凭据的字母表只认英文大小写字母、数字",
+    ),
+    (
+        "控制台收下不认得的 key（规矩只写在文档里）",
+        ADMIN,
+        "    if not keys_module.spelling_ok(offered):",
+        "    if False:",
+        "控制台不该收下",
+    ),
+    (
+        "配置节点收下不认得的密码（默认钥匙不受同一条规矩管）",
+        NODES,
+        "        if password and not keys_module.spelling_ok(password):",
+        "        if False:",
+        "应当被拒，而不是悄悄存下来",
     ),
 ]
 
