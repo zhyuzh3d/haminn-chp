@@ -12,4 +12,7 @@ tests cannot provide.
 
 from __future__ import annotations
 
-__version__ = "3.1.1"
+#: 3.2.0 = 加法（第九个顶层键 `speech`、第八个 endpoint、三条新错误码、key 授权），
+#: 向后兼容，所以走第二段。``spec`` 仍是 ``chp/2``：图片侧契约一个字没变，
+#: 升 ``chp/3`` 会让还没更新的客户端连绘图卡一起报"插件比应用新"，那是白挨的伤。
+__version__ = "3.2.0"

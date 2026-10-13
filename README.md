@@ -4,12 +4,14 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 任何客户端（HamDraw 本体、其他开发者的工具、只会发 curl 的脚本）只要认下面这一个 HTTP 契约，就能用你已经装好的 ComfyUI 出图，**不需要自己导出工作流 JSON** —— 五个场景的图都内置在插件里。
 
+3.2.0 起这个契约多了一条**语音**：同一台机器上已经装好的 TTS 引擎也照同样的形状播报出来，一个请求直接回音频字节。`spec` 仍是 `chp/2`（图片侧一个字没变），新的一段在第九个顶层键 `speech` 里，见「语音（TTS）」一节。
+
 - 规范标识：`chp/2`（响应体里的 `spec`）
 - 接口根路径：`/chp`（**路径不版本化**；地址一律从文档的 `endpoints` 里读，客户端不要自己拼）
 - 契约文本：[`plans/chp-spec.md`](../plans/chp-spec.md)；落地计划：[`plans/chp-v2-plan.md`](../plans/chp-v2-plan.md)
 - 目录：把 `hamdraw_chp/` 整个放进 ComfyUI 的 `custom_nodes/`
 
-**新客户端第一步先调信息接口**（公开，不要密码）：它一次给出这台机器上**有哪些场景、每个场景收什么请求体、背后是哪几个模型文件、每个场景能出哪些画幅、这条场景的编码器认不认中文、以及你带的密码对不对**。
+**新客户端第一步先调信息接口**（公开，不要密码）：它一次给出这台机器上**有哪些场景、每个场景收什么请求体、背后是哪几个模型文件、每个场景能出哪些画幅、这条场景的编码器认不认中文、有没有语音能力（有哪些音色）、以及你带的密码对不对**。
 
 ## 安装
 
@@ -36,7 +38,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
    curl -s http://127.0.0.1:8188/chp/info
    ```
 
-   返回 JSON，且 `spec` 为 `chp/2`、`plugin.version` 是你期望的那一版（当前 **3.1.1**）、每个能力的 `ready` 为 `true`，即成功。
+   返回 JSON，且 `spec` 为 `chp/2`、`plugin.version` 是你期望的那一版（当前 **3.2.0**）、每个能力的 `ready` 为 `true`，即成功。
 
    信息端点**也要钥匙**（前提是配了至少一把）。没带或带错 ⇒ `401`，而那个响应体里多一个 `spec` —— 它自证“这里是 CHP，只是钥匙不对”，客户端因此不必靠猜 URL 去分辨“地址填错了”和“钥匙不对”。这两种情况给用户的下一步动作完全不同。
 
@@ -165,6 +167,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 | `output` | `GET /chp/jobs/{job_id}/output/{index}` | Bearer | 取成图（直接返回 PNG） |
 | `cancel` | `POST /chp/jobs/{job_id}/cancel` | Bearer | 取消排队中的作业 |
 | `translate` | `POST /chp/translate` | 见下 | 提前翻译（可选，用于把译文显示给用户） |
+| `speech` | `POST /chp/speech` | 见下 | 语音：**一次请求直接回音频字节**（`stream` 决定 `audio/pcm` 还是 `audio/wav`），**不套作业模型**。`category` 同样在**执行层**校验 ⇒ 不在钥匙授权集里就 `403 forbidden_capability` |
 
 **`progress` 允许为 `null`，而且经常就是 `null`。** 编一个假百分比比给 `null` 更糟；`queue_position`（前面还有几个作业，自己在跑时为 0）是任何实现都算得出来的可靠数字，客户端用不确定态 + 队列位置就够了。
 
@@ -182,7 +185,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 | 钥匙 | 从哪来 | 权限 |
 |---|---|---|
 | **默认钥匙** | 配置节点里的 `password`，或环境变量 `HAMDRAW_PASSWORD`。老客户端手里就是这个。 | 全部场景 |
-| **key 表** | 包目录里的 `chp_keys.json`（**与本文件同级**，不在版本库里，权限 0600）。每把 key 写它自己的 `categories`，`["*"]` 表示全部 | 就是它写的那些 |
+| **key 表** | 包目录里的 `chp_keys.json`，也就是 `custom_nodes/hamdraw_chp/chp_keys.json`（与 `keys.py` 同级，**不在版本库里**；里面是凭据，建议 `0600`）。每把 key 写它自己的 `categories`，`["*"]` 表示全部 | 就是它写的那些 |
 
 ```json
 { "schema": "chp-keys/v1",
@@ -194,7 +197,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 **密码和 key 用什么字符都行，含中文** —— 比对按 UTF-8 字节做。这条有来由：`hmac.compare_digest` 喂它一个含非 ASCII 的 `str` 会直接抛异常，而"密码里有个「中」字"对运维是再普通不过的一件事 —— 坏起来不是拒收，是**整条请求 500**。
 
-## 五个场景（`category`）
+## 提交作业（`jobs`）
 
 ### 两个扩展通道
 
@@ -260,11 +263,117 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 `job` 对象里三个字段回答“提示词到底发生了什么”：`prompt_source` 是客户端给的原文、`prompt` 是实际送进模型的那份、`translated` 表示两者是否不同。
 
-错误码：`unauthorized(401)` / `bad_request` / `unsupported_category` / `unsupported_size` / `unsupported_steps` / `bad_image` / `bad_mask` / `stretched_reference` / `invalid_workflow` / `forbidden_capability(403)` / `no_model(409)` / `busy(429)` / `duplicate_request(409)` / `not_found(404)` / `internal(500)`，全部带可读中文文案。`/chp/info` 的 `errors` 就是这份清单，所以客户端不必自己抄一遍。**其中只有 `unauthorized` 的响应体多一个 `spec`**（客户端靠它把「是 CHP、只是钥匙不对」和「那里没有插件」分开），其余错误码的形状一个字节都没变。
+错误码：`unauthorized(401)` / `bad_request` / `unsupported_category` / `unsupported_size` / `unsupported_steps` / `bad_image` / `bad_mask` / `stretched_reference` / `invalid_workflow` / `unsupported_voice(400)` / `forbidden_capability(403)` / `no_model(409)` / `no_engine(409)` / `speech_failed(502)` / `busy(429)` / `duplicate_request(409)` / `not_found(404)` / `internal(500)`，全部带可读中文文案。`/chp/info` 的 `errors` 就是这份清单，所以客户端不必自己抄一遍。**其中只有 `unauthorized` 的响应体多一个 `spec`**（客户端靠它把「是 CHP、只是钥匙不对」和「那里没有插件」分开），其余错误码的形状一个字节都没变。
 
 ### `/cvp` 与 `/hamdraw/v1` 都不存在了
 
 插件 2.3.0 之前叫 CVP，主根是 `/cvp`；改名成 CHP 之后主根是 `/chp`，`/cvp` 曾作为过渡别名保留。**`chp/2` 起别名整条删掉**：客户端被告知从 `endpoints` 里读地址，于是“同一个 API 的两种拼法”成了一个这一版故意不再做的承诺。`/hamdraw/v1` 那套旧投影面更早以前就整块删除了。
+
+## 语音（TTS）
+
+**一条规则、一个地址、不套作业模型。** 图片侧是"提交 → 轮询 → 取件"，因为一张 9:16 成品图要 20~45 秒；一句话只要一两秒，**而且慢的正是首字节** —— 排队位次、进度百分比、取消、分件取回，为 1.5 秒的音频付这些是抄形状不抄理由。所以语音只有 `POST /chp/speech` 一个地址：**一次请求，边合成边回字节**。
+
+### `speech` 段（信息文档的第九个顶层键）
+
+`GET /chp/info` 多了一节 `speech`，形状与图片侧那两张表一样，只是都装在这一个键里：
+
+```json
+"speech": {
+  "rules": [
+    { "category": "speak", "rule": "txt-2-sph", "signature": "txt-2-sph",
+      "input": "txt-2-sph/v1",
+      "label": { "zh": "朗读", "en": "Speak" },
+      "needs": { "text": true }, "typical_seconds": 1.2 }
+  ],
+  "abilities": [
+    { "name": "qwen3-tts-0.6b", "ready": true, "missing": [],
+      "files": { "engine": "qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf" },
+      "audio": { "sample_rate": 24000, "channels": 1,
+                 "formats": ["pcm", "wav"], "streaming": true },
+      "voices": [ { "id": "vivian", "label": "Vivian", "languages": ["zh", "en"] }, "…" ] }
+  ],
+  "input_schemas": { "txt-2-sph/v1": { "…": "…" } }
+}
+```
+
+- **规则签名沿用同一套文法**：模态词表加一个字 `sph`（speech），`txt-2-sph` 就是"文本 → 语音"。将来真有音乐/音效再加 `aud`，两者不混。按 `signature` 匹配能力槽的客户端因此**不必为语音写第二套协议**，只是多一条规则。
+- **那条规则里没有 `prompt`，也没有 `defaults`**，这是有意的：`prompt.language` 是翻译的开关，`defaults` 装的是参考权重这类图片侧的东西 —— 少一个字段就少一条会走错的路。它声明的输入只有一个 `text`（`needs: {"text": true}`）。
+- **`audio` 是这份能力自己的输出规格**（采样率 / 声道 / 容器 / 支不支持流式），客户端**读它、不猜它**。今天引擎固定 24 kHz 单声道。
+- **`files.engine` 用的就是引擎自己的模型文件名**，与图片侧 `files.checkpoint` 同一个位置、同一个道理：这台机器上跑的是哪个模型，是可播报的事实。
+- **音色菜单的取值与顺序来自部署**（`speech.voices`，见下），标签与语言来自插件里手写的那张表；**第一个就是默认音色**。客户端**只选不算**，服务端**成员校验**。有些引擎的 `/v1/voices` 是空的 ⇒ 这张表只能由实现手写并播报。
+- **语音那份请求 schema 住在 `speech.input_schemas` 里**（键 `txt-2-sph/v1`，与规则条目的 `input` 同名）。顶层那个 `input_schemas` **仍然只有图片侧那三份** —— "同一规则共用一份 schema"的规矩没变，只是语音那一份与它自己的两张表放在一起。
+
+### 请求体：`POST /chp/speech`
+
+| 字段 | 类别 | 说明 |
+|---|---|---|
+| `text` | 规则参数，必填 | **要念出来的字**。**永不翻译**，见下。超过 2000 字会被**截断**（上限是本实现的一道闸，不是协议条文 —— 不设的话一段粘贴进来的长文会占着引擎算很久，而客户端等的是一句话） |
+| `voice` | 规则参数 | 该能力 `voices[]` 里的 `id`。schema 里它是必填（客户端应当总是发它），服务端对**省略**却是宽容的：**省略即菜单第一项** —— 与 `ext_params.step` 省略时取该类别自己那一档同一条规矩，默认值是**表里的一个成员**，不是一个自己算的常量（写死一个名字的话，运维把菜单换成另一台引擎的音色之后，省略 `voice` 的客户端就会拿到一个不存在的名字）。未知音色 ⇒ `400 unsupported_voice` |
+| `language` | 规则参数，可省 | `zh` / `en` / …；省略由引擎取默认 |
+| `response_format` | 规则参数，可省 | `pcm` / `wav`；**省略时与 `stream` 配对**（流式默认裸 `pcm`、整包默认 `wav`）。一个请求只该选"怎么听"，不该顺带要求客户端知道"容器"是第三个旋钮 |
+| `stream` | 规则参数，可省 | 省略 = `true` |
+| `speed` | 规则参数，可省 | 语速倍率；给了就转给引擎（引擎不认就忽略） |
+| `chp_params` | 扩展通道 | 有 body 的 POST ⇒ 密码放这里（无新规矩） |
+
+**`text` 不叫 `prompt`，这是承重的命名。** `prompt` 在 CHP 里**带副作用**：`rules[].prompt.language` 为 `"en"` 会让服务端在**提交路径上自动翻译**。语音的输入是"要原样念出来的话"，接上那条规则就会把中文念成英文。所以这条规则里没有 `prompt`，`text` 也**永不翻译** —— 这一句是规则不是建议。实现里这条规矩是有形状的：`validate()` 故意写成**同步**函数，想在这里插一次翻译就得先有一个不存在的 `await`。`text` 还与模态名 `txt` 同字，符合既有构词法（`category` ← 规则的 `category`，`resolution` ← 帧表的 `resolution`，`text` ← 模态的 `txt`）。
+
+```json
+{ "text": "你好，这是一次测试。", "voice": "vivian", "stream": true,
+  "chp_params": { "password": "<password>" } }
+```
+
+### 传输：一条路由，`stream` 决定内容类型
+
+| | `stream: true`（默认） | `stream: false` |
+|---|---|---|
+| `Content-Type` | `audio/pcm` | `audio/wav` |
+| 响应头 | `X-Sample-Rate: 24000`、`X-Channels: 1` | 同左 |
+| body | 裸 s16le 分块，按 4 KiB 一片转发 | 整个文件 |
+
+`X-Sample-Rate` **两种形态都给**：裸 PCM 不给这个头就播不了，而整包那份也带着它，客户端读一个值就不必为两种形态写两条路。**错误一律是 JSON**，而且在开始写 body **之前**就用状态码定好了 —— 客户端的判据是"先看状态码，非 2xx 就按 JSON 解析"。首字节之后才出的错没法再变成状态码，那种情况只能断开连接并在日志里留一行。
+
+### 拒绝：三条新错误码
+
+| 码 | HTTP | 什么时候 |
+|---|---|---|
+| `unsupported_voice` | 400 | 这个音色不在 `speech.abilities[].voices` 里（`detail` 把那份菜单带回来） |
+| `no_engine` | 409 | 没配 `speech.url`、连不上、或引擎回 `401`/`403`（令牌不对） |
+| `speech_failed` | 502 | 引擎在跑，但没正常应答（回 `500` 之类） |
+
+`401`/`403` 收敛成 `no_engine` 而不是一个新码：对客户端来说"引擎要令牌而这台机器没配对"与"引擎没在跑"是同一件事 —— 都要运维去改那台机器，而它自己能做的动作一模一样。
+
+**且执行层那道授权照旧先做**：`speak` 不在钥匙的授权集里 ⇒ `403 forbidden_capability`（在必填字段检查**之前**判），与 `jobs` 同一条规矩。
+
+**引擎地址与令牌永不进文档、永不进响应。** 不论连不上、令牌错还是引擎 500，一律收敛成上面三条，明细**只进那台机器的日志**（`translate.py` 已在遵守的同一条规矩）。实现上这条规矩是有形状的：判定函数只收一个**状态码**，引擎说的话没有任何入口。
+
+### 部署参数（HTTP 上永远看不见）
+
+```json
+"speech": {
+  "url": "http://127.0.0.1:8021",
+  "token": "",
+  "engine": "qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf",
+  "voices": ["vivian", "serena", "uncle_fu", "dylan", "eric",
+             "aiden", "ono_anna", "sohee", "ryan"],
+  "sample_rate": 24000,
+  "timeout": 60.0
+}
+```
+
+写在 `custom_nodes/hamdraw_chp/hamdraw_settings.json` 里（与 `families.*` 那些部署旋钮同一个文件）；容器/CI 用两个环境变量覆盖：`HAMDRAW_SPEECH_URL`、`HAMDRAW_SPEECH_TOKEN`。
+
+| 键 | 不给会怎样 |
+|---|---|
+| `url` | 给不出 `no_engine`；`speech.abilities` 播报 `ready: false`、`missing: ["url"]` |
+| `token` | 引擎回 `401` ⇒ 同样收敛成 `no_engine` |
+| `voices` / `sample_rate` / `timeout` | 用出厂值照跑。`voices` 是**这台机器上引擎支持的那几个名字**，换引擎才要改；写成空数组 ⇒ `ready: false`、`missing: ["voices"]`（配了引擎却一个音色都没有，一样是答不了，而"缺的是哪一档"要说出来） |
+| `engine` | 只用于播报（`files.engine`），不影响跑 |
+
+**`token` 与 CHP 自己的密码是两把不同的钥匙**：密码是「客户端 ↔ CHP」，令牌是「CHP ↔ 引擎」。两者都在 `hamdraw_settings.json` 里、同一个信任级别。
+
+**引擎要的是 OpenAI 那套 `POST {url}/v1/audio/speech`**（地址给到根、给到 `/v1`、给到 `/v1/audio` 都行，插件自己补齐），body 是 `{input, voice, response_format, stream}`（客户端给了 `language` / `speed` 就一起带上），带 `Authorization: Bearer <token>`。**不传 `model`**：这台机器上加载的是哪个模型是引擎自己的事，`speech.engine` 只播报、不外发。
+
+**ComfyUI 重启会带走语音** —— 多了一个耦合，与 `translate` 今天的处境完全一样；`timeout` 兜底。
 
 ## 自测
 
@@ -290,9 +399,21 @@ curl -s -H 'Authorization: Bearer <password>' -o out.png http://<host>:8188/chp/
 curl -s -X POST http://<host>:8188/chp/jobs -H 'Content-Type: application/json' \
   -d '{"category":"inpaint","prompt":"一只红色的狐狸","image_base64":"data:image/png;base64,...",
        "mask_base64":"data:image/png;base64,...","chp_params":{"password":"<password>"}}'
+
+# 4. 语音：流式（默认）—— 裸 PCM 分块，听的时候首字节最先到
+curl -s -D- -X POST http://<host>:8188/chp/speech -H 'Content-Type: application/json' \
+  -d '{"text":"你好，这是一次测试。","voice":"vivian",
+       "chp_params":{"password":"<password>"}}' -o speech.pcm
+
+# 5. 语音：整包 —— 换 stream:false，拿到一个能直接播的 wav
+curl -s -D- -X POST http://<host>:8188/chp/speech -H 'Content-Type: application/json' \
+  -d '{"text":"你好，这是一次测试。","voice":"vivian","stream":false,
+       "chp_params":{"password":"<password>"}}' -o speech.wav
 ```
 
-用 `python3 -m json.tool` 过一遍第 1 步的返回，重点确认五件事：`spec` 是 `chp/2`、`rules` 有你预期的五条、`abilities` 的 `ready` 为 `true`、每个 `category` 至少命中一帧、`input_schemas` 恰好三份（三条规则各一份）。
+用 `python3 -m json.tool` 过一遍第 1 步的返回，重点确认六件事：`spec` 是 `chp/2`、`rules` 有你预期的五条、`abilities` 的 `ready` 为 `true`、每个 `category` 至少命中一帧、`input_schemas` 恰好三份（三条规则各一份）、`speech` 段里有 `txt-2-sph` 那条规则与那份音色菜单（引擎没配时它是 `ready: false`，不是缺失）。
+
+第 4 / 5 步看响应头：`Content-Type` 分别是 `audio/pcm` 与 `audio/wav`，两者都带 `X-Sample-Rate`。播第 5 步那个文件最简单（`afplay speech.wav` / 双击）；第 4 步那份是裸 PCM，播放器要知道参数：`24000 Hz`、单声道、`s16le`。
 
 - **第一次请求会慢**（模型加载，约十几秒），之后同模型重跑约 1 秒；别用首单判断“模型太慢”。
 - 在 HamDraw App 里对接：设置 → 模型配置 → 接口模式选「CHP 插件（ComfyUI Haminn Protocol）」，服务器地址填 `http://<host>:<port>`，访问密码填节点里设的那个。

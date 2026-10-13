@@ -31,6 +31,8 @@ ENVIRONMENT_FILE = "HAMDRAW_SETTINGS"
 ENVIRONMENT_TRANSLATE_URL = "HAMDRAW_TRANSLATE_URL"
 ENVIRONMENT_TRANSLATE_MODEL = "HAMDRAW_TRANSLATE_MODEL"
 ENVIRONMENT_TRANSLATE_DISABLED = "HAMDRAW_TRANSLATE_DISABLED"
+ENVIRONMENT_SPEECH_URL = "HAMDRAW_SPEECH_URL"
+ENVIRONMENT_SPEECH_TOKEN = "HAMDRAW_SPEECH_TOKEN"
 
 #: Driven by the category table, so a category added there is configurable
 #: here without a second list to keep in step.
@@ -53,6 +55,31 @@ TRANSLATE_MEMORY_RANGE = (0, 200000)
 
 #: 加速 LoRA 的强度。0 等于不挂, 2 已经是能把图拧坏的上限 —— 这里只挡住明显的手滑。
 ACCELERATOR_STRENGTH_RANGE = (0.0, 2.0)
+
+#: 语音（TTS）那一档。**地址出厂是空的** —— 与 ``translate.url`` 同一条规矩:
+#: 插件不替任何部署写死一个地址, 没有地址就没有语音能力（而不是给一个猜的）。
+#: 令牌同理: 它是「CHP ↔ 引擎」这把钥匙, 只从部署侧来, 永不走 HTTP。
+SPEECH_TIMEOUT_RANGE = (3.0, 300.0)
+SPEECH_SAMPLE_RATE_RANGE = (8000, 192000)
+
+#: 出厂音色表 —— **这台机器上引擎认得的名字**, 换引擎才要改。顺序即规范（第一个是默认音色），
+#: 与 :data:`RECOMMENDED_CHECKPOINT` 同性质: 是一个可以覆盖的建议, 不是契约条文。
+#: 规范只要求「至少有一个音色」, 具体有哪些是**实现的取值**。
+DEFAULT_VOICES: tuple[str, ...] = (
+    "vivian", "serena", "uncle_fu", "dylan", "eric",
+    "aiden", "ono_anna", "sohee", "ryan",
+)
+
+#: 引擎自己的模型文件名 —— 只进文档的 ``speech.abilities[].files.engine``, 不参与发请求。
+#: 同图片侧的 ``files.checkpoint``: 「这台机器上跑的是哪个模型」是可播报的事实。
+DEFAULT_SPEECH_ENGINE = "qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf"
+
+#: 引擎固定 24 kHz 单声道（实测）。这里是默认值, 文档里播报的是这个数。
+DEFAULT_SAMPLE_RATE = 24000
+
+#: 音频引擎自己那一档的超时。**首字节是慢的那一半**（引擎首次请求要加载模型），
+#: 所以它比翻译那档宽得多。
+DEFAULT_SPEECH_TIMEOUT = 60.0
 
 #: 哪几个类别走"三件套"而不是单个 checkpoint —— 由类别表的 roles 算出来, 不另写一份。
 TRIPLE_TASKS: tuple[str, ...] = tuple(
@@ -102,6 +129,16 @@ DEFAULTS: dict[str, Any] = {
         "model": "qwen3-0.6b",
         "timeout": 25.0,
         "memory_limit": 4000,
+    },
+    # 语音: 只有 ``url`` 是"不给就没有能力"的那一档; 其余四项都有可用默认, 照跑。
+    # ``voices`` 是这台机器上引擎支持的名字（顺序即菜单顺序, 第一个是默认音色）。
+    "speech": {
+        "url": "",
+        "token": "",
+        "engine": DEFAULT_SPEECH_ENGINE,
+        "voices": list(DEFAULT_VOICES),
+        "sample_rate": DEFAULT_SAMPLE_RATE,
+        "timeout": DEFAULT_SPEECH_TIMEOUT,
     },
 }
 
@@ -202,6 +239,23 @@ def _merge(base: dict[str, Any], stored: dict[str, Any]) -> dict[str, Any]:
             translation.get("timeout"), base["translate"]["timeout"], TRANSLATE_TIMEOUT_RANGE)
         base["translate"]["memory_limit"] = int(_number(
             translation.get("memory_limit"), base["translate"]["memory_limit"], TRANSLATE_MEMORY_RANGE))
+
+    speech = stored.get("speech")
+    if isinstance(speech, dict):
+        for key in ("url", "token", "engine"):
+            value = speech.get(key)
+            if isinstance(value, str):
+                base["speech"][key] = value.strip()
+        # 空表**保持为空**: 「一台音色都没有」是一个正经答案（那条能力因此 not ready），
+        # 不该被落回出厂那九个名字 —— 运维把名单清空, 就是要它没有音色。
+        voices = speech.get("voices")
+        if isinstance(voices, list):
+            base["speech"]["voices"] = [str(item).strip() for item in voices
+                                        if str(item or "").strip()]
+        base["speech"]["sample_rate"] = int(_number(
+            speech.get("sample_rate"), base["speech"]["sample_rate"], SPEECH_SAMPLE_RATE_RANGE))
+        base["speech"]["timeout"] = _number(
+            speech.get("timeout"), base["speech"]["timeout"], SPEECH_TIMEOUT_RANGE)
     return base
 
 
@@ -237,6 +291,34 @@ def translate() -> dict[str, Any]:
         "model": model.strip(),
         "timeout": _number(stored["timeout"], 25.0, TRANSLATE_TIMEOUT_RANGE),
         "memory_limit": int(_number(stored["memory_limit"], 4000, TRANSLATE_MEMORY_RANGE)),
+    }
+
+
+def speech() -> dict[str, Any]:
+    """Where to send text to be spoken, after the environment has had its say.
+
+    ``available`` is exactly "an engine address is configured" — the same slot
+    ``translate()``'s ``enabled`` occupies, so a caller reads it to decide between
+    publishing ``ready: true`` and answering ``no_engine`` instead of testing for
+    emptiness itself.  Never raises: a missing address is a deployment state, not
+    an error.
+
+    The token is here and **only** here — it belongs to the CHP↔engine line, so it
+    never reaches the document or a response (the same rule ``translate.url``
+    already follows).
+    """
+    stored = load()["speech"]
+    url = os.environ.get(ENVIRONMENT_SPEECH_URL, "").strip() or str(stored["url"])
+    token = os.environ.get(ENVIRONMENT_SPEECH_TOKEN, "").strip() or str(stored["token"])
+    return {
+        "available": bool(url.strip()),
+        "url": url.strip(),
+        "token": token.strip(),
+        "engine": str(stored["engine"]).strip(),
+        "voices": [str(name) for name in stored["voices"]],
+        "sample_rate": int(_number(stored["sample_rate"], DEFAULT_SAMPLE_RATE,
+                                   SPEECH_SAMPLE_RATE_RANGE)),
+        "timeout": _number(stored["timeout"], DEFAULT_SPEECH_TIMEOUT, SPEECH_TIMEOUT_RANGE),
     }
 
 

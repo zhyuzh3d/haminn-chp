@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .version import __version__
 
@@ -64,6 +64,9 @@ ENDPOINTS: dict[str, str] = {
     "output": f"{API_ROOT}/jobs/{{job_id}}/output/{{index}}",
     "cancel": f"{API_ROOT}/jobs/{{job_id}}/cancel",
     "translate": f"{API_ROOT}/translate",
+    # 第八个键：语音。它是**唯一**不套作业模型的路由（一次请求、边合成边回字节），
+    # 但「地址从文档里读」这条规矩对它一字不改 —— 所以它必须出现在这里。
+    "speech": f"{API_ROOT}/speech",
 }
 
 #: The IO rule table.  Three rules, and their modalities are written in the
@@ -102,10 +105,21 @@ def needs_image(category: str) -> bool:
     return bool(entry) and bool((entry.get("needs") or {}).get("image"))
 
 
+def join_rule(modalities: Iterable[str], output: str) -> str:
+    """``("txt", "msk", "ref")`` + ``"img"`` → ``txt-msk-ref-2-img``。
+
+    **规则名的唯一拼法。** 规则名是派生出来的而不是写下来的，所以一条规则不可能
+    拥有一个与它自己的模态表不一致的名字；而它之所以是个公开函数，是因为语音侧
+    的 ``txt-2-sph`` 遵守同一套文法却不住在这张表里（它住 :mod:`.speech`）——
+    「模态加一个字」这件事不该再多一份拼名逻辑。
+    """
+    return "-".join((*modalities, "2", str(output)))
+
+
 def signature_of(rule: str) -> str:
     """``txt-ref-2-img`` — the modality list joined by the rule's own separator."""
     entry = RULES[str(rule)]
-    return "-".join((*entry["modalities"], "2", entry["output"]))
+    return join_rule(entry["modalities"], entry["output"])
 
 
 def input_of(rule: str) -> str:
@@ -673,6 +687,7 @@ def input_schemas(allowed: set[str] | None = None) -> dict[str, dict[str, Any]]:
 
 def document(*, files_of: Callable[[str], Any], authorized: bool, auth_required: bool,
              translation: dict[str, Any], allowed: set[str] | None = None,
+             speech: dict[str, Any] | None = None,
              auth_hint: str = "", errors: list[str] | None = None) -> dict[str, Any]:
     """The whole discovery document, as one key is allowed to see it.
 
@@ -691,6 +706,12 @@ def document(*, files_of: Callable[[str], Any], authorized: bool, auth_required:
     ``translation`` and ``files_of`` are supplied by the caller rather than read
     here: this module is the specification, and it must not depend on the parts
     of the server that touch the network or ComfyUI's model folders.
+
+    ``speech`` is the same arrangement for the ninth top-level key: the speech
+    module owns its own two tables (they are not categories of this table — a
+    voice is not a canvas), builds them itself, and hands over a finished
+    section.  This function carries it and nothing more, which is why adding a
+    capability that is not an image touched no line of the image logic.
     """
     payload: dict[str, Any] = {
         "spec": SPEC,
@@ -708,6 +729,10 @@ def document(*, files_of: Callable[[str], Any], authorized: bool, auth_required:
         "input_schemas": input_schemas(allowed),
         "translation": deepcopy(translation or {}),
     }
+    if speech is not None:
+        # **整段由调用方过滤好了再交过来**（`speech.describe(allowed)`）：过滤规则属于
+        # 拥有那张表的那一层，这里的 ``allowed`` 管不到它，硬管就得在这里认识语音。
+        payload["speech"] = deepcopy(speech)
     if errors:
         # 参考实现多播报的一项：它认得的错误码。客户端据此把回执翻成人话；
         # 规范只要求「未知顶层键必须忽略」，所以这一项是可选的。
@@ -722,6 +747,7 @@ __all__ = [
     "accepts_image", "categories", "category_of", "check_frames",
     "clamp_ref_strength", "clean_defaults", "default_ref_strength",
     "default_resolution", "document", "family_of", "frames_of", "has_reference",
-    "input_of", "input_schemas", "needs_image", "resolution_size", "rule_entry", "rules",
+    "input_of", "input_schemas", "join_rule", "needs_image", "resolution_size",
+    "rule_entry", "rules",
     "signature_of", "validate_resolution", "validate_step",
 ]

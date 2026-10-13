@@ -85,6 +85,23 @@ Images are uploaded inline as base64 in the job body and are written into
 ``input/hamdraw/`` before the graph runs, so a built-in graph can reference
 them through the ordinary ``LoadImage`` node.
 
+Speech
+------
+``POST /chp/speech`` turns text into a voice, and it is the **one route that is
+not a job**: a sentence takes a second or two and the slow part is the first
+byte, so there is no queue to watch, nothing to cancel and no second call to
+fetch the result.  ``stream`` picks the shape instead — bare PCM in chunks, or
+one whole WAV — and ``response_format`` follows it unless the client says
+otherwise.  The engine itself lives behind :mod:`hamdraw_chp.speech`; its address
+and its token stay on this machine, and a failure becomes one of three codes
+(``unsupported_voice`` / ``no_engine`` / ``speech_failed``) with nothing of the
+engine in the response.
+
+Errors on this route are **JSON with a status code, decided before a byte of
+audio is written** — the client's rule is "look at the status first".  That is
+why the engine's answer is opened before the response is prepared: a failure
+found afterwards cannot be turned back into a status code by anyone.
+
 Translation
 -----------
 A category whose text encoder only reads English declares
@@ -145,6 +162,7 @@ from . import backends
 from . import capabilities as capabilities_module
 from . import families
 from . import keys as keys_module
+from . import speech as speech_module
 from . import settings as settings_module
 from . import translate as translate_module
 from .version import __version__
@@ -187,7 +205,10 @@ ERROR_STATUS = {
     "stretched_reference": 400,
     "invalid_workflow": 400,
     "forbidden_capability": 403,
+    "unsupported_voice": 400,
     "no_model": 409,
+    "no_engine": 409,
+    "speech_failed": 502,
     "busy": 429,
     "duplicate_request": 409,
     "not_found": 404,
@@ -205,6 +226,9 @@ ERROR_MESSAGES = {
     "stretched_reference": "参考图的宽高比和这次任务的分辨率不一致：按分辨率缩放会把它压变形，而变形之后从成图上完全看不出来。请按任务分辨率合成参考图再提交。",
     "invalid_workflow": "内置工作流校验失败，可能是模型或节点缺失。",
     "forbidden_capability": "这把 key 没有这个能力。",
+    "unsupported_voice": "这台引擎没有这个音色，请从信息接口 speech.abilities[].voices 里取。",
+    "no_engine": "没有可用的语音引擎，请先在 CHP 配置里填好语音服务地址。",
+    "speech_failed": "语音引擎没有正常应答。",
     "no_model": "没有可用的模型，请先在 CHP 插件配置节点里选好这个场景要用的模型。",
     "busy": "队列已满，请稍后再试。",
     "duplicate_request": "这个 request_id 已经用过了：重发同一次提交请沿用同一个 request_id，换一份内容请换一个 request_id。",
@@ -657,6 +681,7 @@ async def info(request: web.Request) -> web.Response:
             authorized=True,
             auth_required=_keys_configured(),
             translation=translate_module.describe(),
+            speech=speech_module.describe(keys_module.allowed_of(record)),
             auth_hint=AUTH_HINT,
             errors=sorted(ERROR_STATUS),
         )
@@ -1008,6 +1033,61 @@ async def translate_prompts(request: web.Request) -> web.Response:
     return _json(outcome)
 
 
+async def speech_endpoint(request: web.Request) -> web.StreamResponse:
+    """``POST /chp/speech`` — one request, bytes coming back as they are made.
+
+    Two shapes on purpose: ``stream: true`` writes bare PCM as the engine produces
+    it (which is what a player wants — the slow part is the *first* byte), and
+    ``stream: false`` answers with one whole file, for tools that can only do
+    "POST once, take one lump".  Both carry ``X-Sample-Rate``: PCM cannot be
+    played without it, and a client that always reads it needs no second path.
+
+    Every refusal here is JSON with a status code, and it happens **before the
+    response is prepared** — which is why the engine's answer is opened first and
+    its verdict read from it.  A failure that arrives after audio has started can
+    no longer be a status code (nobody can change a status line once it is sent),
+    so it is logged by :mod:`hamdraw_chp.speech` and the connection is dropped,
+    which is the only honest thing left.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _fail("bad_request")
+    if not isinstance(body, dict):
+        return _fail("bad_request")
+    record = _key_of(request, body)
+    if record is None:
+        return _unauthorized()
+    # 执行层（承重）：语音有自己的 category，所以它过的是同一道门 —— 而不是自己
+    # 另写一套。少了这一句，一把只授权了画图的 key 就能白念语音。
+    if not keys_module.permits(record, speech_module.CATEGORY):
+        return _fail("forbidden_capability",
+                     detail={"category": speech_module.CATEGORY,
+                             "key": keys_module.label_of(record)})
+    try:
+        fields = speech_module.validate(body)
+    except speech_module.SpeechError as refused:
+        return _fail(refused.code, refused.message, detail=refused.detail)
+
+    headers = speech_module.headers_of(fields, settings_module.speech())
+    started = False
+    try:
+        async with speech_module.speak(fields) as answer:
+            if not fields["stream"]:
+                return web.Response(body=await answer.read(), status=200, headers=headers)
+            response = web.StreamResponse(status=200, headers=headers)
+            await response.prepare(request)
+            started = True
+            async for chunk in answer.content.iter_chunked(speech_module.CHUNK_BYTES):
+                await response.write(chunk)
+            await response.write_eof()
+            return response
+    except speech_module.SpeechError as refused:
+        if started:
+            raise
+        return _fail(refused.code, refused.message, detail=refused.detail)
+
+
 # --------------------------------------------------------------------------- #
 # wiring
 # --------------------------------------------------------------------------- #
@@ -1037,6 +1117,7 @@ def register_routes(routes: Any = None) -> bool:
     routes.get(f"{API_ROOT}/jobs/{{job_id}}/output/{{index}}")(job_output)
     routes.post(f"{API_ROOT}/jobs/{{job_id}}/cancel")(cancel_job)
     routes.post(f"{API_ROOT}/translate")(translate_prompts)
+    routes.post(f"{API_ROOT}/speech")(speech_endpoint)
     return True
 
 

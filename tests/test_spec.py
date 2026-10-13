@@ -41,14 +41,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import inspect
+import io
 import json
 import os
 import sys
 import tempfile
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -63,12 +65,114 @@ def _stub(name: str, **attributes) -> None:
 
 
 class FakeResponse:
-    """The little of ``aiohttp.web.Response`` a handler's answer needs reading."""
+    """The little of ``aiohttp.web.Response`` a handler's answer needs reading.
 
-    def __init__(self, payload: Any, status: int = 200) -> None:
+    ``body`` is the one thing ``/chp/speech`` needs that the JSON answers never
+    did: the whole-file shape answers with raw audio bytes rather than a document.
+    """
+
+    def __init__(self, payload: Any = None, status: int = 200, *,
+                 body: Any = None, headers: dict[str, str] | None = None) -> None:
         self.payload = payload
         self.status = status
-        self.headers: dict[str, str] = {}
+        self.body = body
+        self.headers = dict(headers or {})
+
+
+class FakeStreamResponse:
+    """A stand-in for ``aiohttp.web.StreamResponse`` that remembers the audio."""
+
+    def __init__(self, status: int = 200, headers: dict[str, str] | None = None) -> None:
+        self.status = status
+        self.headers = dict(headers or {})
+        self.audio = b""
+        self.prepared = False
+        self.finished = False
+
+    async def prepare(self, request: Any) -> "FakeStreamResponse":
+        self.prepared = True
+        return self
+
+    async def write(self, chunk: bytes) -> None:
+        # **prepare 之前不许写。** 真的 aiohttp 会抛，这里也必须抛 —— 那正是
+        # 「错误要在开始写 body 之前定好」那条规矩赖以成立的机制。
+        if not self.prepared:
+            raise RuntimeError("write() 在 prepare() 之前")
+        self.audio += bytes(chunk)
+
+    async def write_eof(self) -> None:
+        self.finished = True
+
+
+class FakeClientError(Exception):
+    """Stand-in for ``aiohttp.ClientError``: what an unreachable engine raises."""
+
+
+class FakeConnectionError(FakeClientError):
+    """Stand-in for ``aiohttp.ClientConnectionError``."""
+
+
+#: 假引擎。语音转发那条路在离线测试里没有网络可走，而它恰好是本轮最需要判据看着的
+#: 一段（内容类型、错误收敛、有没有把地址漏出去）。做法与 ``FAKE_SERVER`` 一致：
+#: 换掉 aiohttp 那一层，协议层以上一个字节都不改。
+ENGINE: dict[str, Any] = {}
+ENGINE_CALLS: list[dict[str, Any]] = []
+#: 假翻译器，按**地址**分派 —— 翻译与语音共用同一个 aiohttp 替身，而「语音不自动翻译」
+#: 这条判据只有在翻译**真的可用**时才证得出来（翻译关着的时候，"没被翻译"是废话）。
+TRANSLATOR: dict[str, Any] = {}
+
+
+class FakeUpstream:
+    """What ``session.post(...)`` returns: an answer you can enter."""
+
+    def __init__(self, status: int = 200, chunks: Iterable[bytes] = (), body: bytes = b"") -> None:
+        self.status = status
+        self._chunks = [bytes(item) for item in chunks]
+        self._body = bytes(body)
+        self.content = types.SimpleNamespace(iter_chunked=self._iter_chunked)
+
+    async def _iter_chunked(self, size: int):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def read(self) -> bytes:
+        return self._body
+
+    async def text(self) -> str:
+        return self._body.decode("utf-8", "replace")
+
+    async def json(self, **kwargs: Any) -> Any:
+        return json.loads(self._body.decode("utf-8"))
+
+    async def __aenter__(self) -> "FakeUpstream":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+class FakeSession:
+    """The stub ``aiohttp.ClientSession``: records the call, answers what the test set."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+    async def __aenter__(self) -> "FakeSession":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    async def close(self) -> None:
+        pass
+
+    def post(self, url: str, **kwargs: Any) -> FakeUpstream:
+        ENGINE_CALLS.append({"url": url, **kwargs})
+        answers = TRANSLATOR if "/chat/completions" in url else ENGINE
+        failure = answers.get("failure")
+        if failure is not None:
+            raise failure
+        return FakeUpstream(**{key: value for key, value in answers.items() if key != "failure"})
 
 
 def _json_response(payload: Any, status: int = 200, dumps: Any = None) -> FakeResponse:
@@ -80,8 +184,14 @@ def _json_response(payload: Any, status: int = 200, dumps: Any = None) -> FakeRe
 
 # translate.py imports aiohttp at module scope; server.py needs aiohttp.web for
 # its annotations, which ``from __future__ import annotations`` never evaluates.
-_stub("aiohttp", ClientSession=object, ClientTimeout=object,
-      web=types.SimpleNamespace(json_response=_json_response, Response=FakeResponse))
+# The speech route is the first thing here that really *calls* into aiohttp, so
+# the stub has to be able to carry a request: ``ClientTimeout`` takes keywords,
+# ``ClientSession`` is the recorded fake above, and the two error classes exist
+# so ``except aiohttp.ClientError`` has something to name.
+_stub("aiohttp", ClientSession=FakeSession, ClientTimeout=lambda **kwargs: kwargs,
+      ClientError=FakeClientError, ClientConnectionError=FakeConnectionError,
+      web=types.SimpleNamespace(json_response=_json_response, Response=FakeResponse,
+                                StreamResponse=FakeStreamResponse))
 # nodes.py imports these; the folder listing is a fixed little catalogue so the
 # config node can be exercised without ComfyUI.
 _MODEL_FILES = {"checkpoints": ["DreamShaper8_LCM.safetensors", "sd15-realistic.safetensors"]}
@@ -115,7 +225,7 @@ os.environ["HAMDRAW_KEYS"] = str(_SCRATCH / "chp_keys.json")
 for _name in ("HAMDRAW_PASSWORD", "HAMDRAW_TRANSLATE_URL", "HAMDRAW_TRANSLATE_MODEL"):
     os.environ.pop(_name, None)
 
-from hamdraw_chp import backends, capabilities, families, keys, server, settings, translate, version  # noqa: E402
+from hamdraw_chp import backends, capabilities, families, keys, server, settings, speech as speech_module, translate, version  # noqa: E402
 
 
 def check(condition: bool, message: str) -> None:
@@ -199,6 +309,9 @@ def document_of(files_of=fake_files, **overrides: Any) -> dict[str, Any]:
         "authorized": True,
         "auth_required": True,
         "translation": translate.describe(),
+        # 第九个键由**拥有那张表的那一层**过滤好再交过来（`info()` 就是这么调的），
+        # 所以这里也照它的调法传 —— 一个只测 `document()` 的替身会漏掉过滤。
+        "speech": speech_module.describe(),
         "errors": sorted(server.ERROR_STATUS),
     }
     arguments.update(overrides)
@@ -210,7 +323,7 @@ def document_of(files_of=fake_files, **overrides: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 TOP_LEVEL_KEYS = {"spec", "plugin", "auth", "endpoints", "rules", "abilities",
-                  "input_schemas", "translation"}
+                  "input_schemas", "translation", "speech"}
 
 
 def check_information_document() -> None:
@@ -227,13 +340,13 @@ def check_information_document() -> None:
           "文档播报的插件版本必须就是源码里的版本")
     check(document["plugin"]["label"]["zh"] and document["plugin"]["label"]["en"], "自称要双语")
 
-    # 2) 规范规定的八个键一个都不能少; 规范之外只许播报本实现自己的 errors
+    # 2) 规范规定的九个键一个都不能少; 规范之外只许播报本实现自己的 errors
     check(TOP_LEVEL_KEYS <= set(document),
-          f"八个规范键不许少: {sorted(TOP_LEVEL_KEYS - set(document))}")
+          f"九个规范键不许少: {sorted(TOP_LEVEL_KEYS - set(document))}")
     check(set(document) - TOP_LEVEL_KEYS <= {"errors"},
           f"规范之外只许 errors, 得到 {sorted(set(document) - TOP_LEVEL_KEYS)}")
     check(set(document_of(errors=[])) == TOP_LEVEL_KEYS,
-          "不播报错误码时, 顶层就恰好是那八个")
+          "不播报错误码时, 顶层就恰好是那九个")
 
     # 3) auth 如实反映传入值
     check(document["auth"]["required"] is True and document["auth"]["authorized"] is True,
@@ -313,9 +426,10 @@ def check_information_document() -> None:
           "第二条 schema 必须是深拷贝, 不是同一个对象")
     check(json.dumps(document_of(), ensure_ascii=False) != "", "重新取一份文档仍然可用")
 
-    # 8) endpoints: 七个键, 值全部是根相对路径
-    check(set(document["endpoints"]) == {"info", "jobs", "job", "progress", "output", "cancel", "translate"},
-          f"endpoints 七个键, 得到 {sorted(document['endpoints'])}")
+    # 8) endpoints: 八个键, 值全部是根相对路径
+    check(set(document["endpoints"]) == {"info", "jobs", "job", "progress", "output",
+                                        "cancel", "translate", "speech"},
+          f"endpoints 八个键, 得到 {sorted(document['endpoints'])}")
     for key, value in document["endpoints"].items():
         check(value.startswith("/"), f"endpoints.{key} 要以 / 开头(同源相对), 得到 {value}")
 
@@ -1602,6 +1716,292 @@ def check_document_filtering_is_one_pass() -> None:
           f"分组前过滤, 得到 {sorted({f['category'] for f in all_frames})}")
 
 
+def write_settings(**fields: Any) -> None:
+    """Write the scratch settings file by hand — the way an operator edits it.
+
+    ``settings.update()`` carries only what the config node can set, and the speech
+    address is deliberately *not* on that node (it is deployment tuning, exactly
+    like ``translate.url``), so the tests write the file the way the person who owns
+    the machine will.
+    """
+    settings.path().write_text(json.dumps(fields, ensure_ascii=False), encoding="utf-8")
+
+
+def speech_of(body: Any, headers: dict[str, str] | None = None) -> Any:
+    """``POST /chp/speech`` — one request, one route, two content types."""
+    return asyncio.run(server.speech_endpoint(FakeRequest(body, headers)))
+
+
+def engine_answers(**answer: Any) -> None:
+    """Set what the fake engine does next; ``failure=`` makes it misbehave."""
+    ENGINE.clear()
+    ENGINE_CALLS.clear()
+    ENGINE.update(answer)
+
+
+def error_code_of(response: Any) -> str:
+    """The CHP error code in an answer — or ``""`` when the answer is not a refusal.
+
+    A refusal is always JSON, and it always happens before a byte of audio.  Reading
+    the code through this helper means a mutation that turns a refusal into a
+    half-started stream fails under a **named** assertion, instead of as an
+    ``AttributeError`` thrown from the middle of one (which the mutation script
+    would report as ESCAPED — a red test nobody can name).
+    """
+    payload = getattr(response, "payload", None)
+    return str(payload.get("error") or "") if isinstance(payload, dict) else ""
+
+
+def translator_answers(text: str = "a cat on a sofa") -> None:
+    """Make the fake translator answer — deliberately *differently* from the input."""
+    TRANSLATOR.clear()
+    TRANSLATOR.update({"status": 200,
+                       "body": json.dumps({"choices": [{"message": {"content": text}}]}).encode()})
+
+
+#: 引擎那一档的地址与令牌 —— 用**看得见**的字符串，这样"响应里有没有它们"是一条
+#: 读得出来的断言，而不是一句口号。
+ENGINE_URL = "http://127.0.0.1:8021"
+ENGINE_TOKEN = "a1x-tts-not-a-real-token"
+
+
+def check_speech() -> None:
+    """第九个顶层键：语音（计划 §4.2，判据照前身计划 §6 的 S1–S3）。
+
+    这个功能有一半活在「**不许**」里：不许翻译、不许把引擎地址或令牌漏出去、不许在
+    开始写 body 之后才报错、不许碰图片那三张表。所以下面有几条断言是**证否**型的 ——
+    它们在一条做对了的实现上永远是绿的，而要挡的正是"顺手多做了一点"。
+    """
+    try:
+        # ① 装配期断言：出厂表空了、或两个音色同名，是**这份代码**的事实，导入时就该报
+        #    （照 check_frames 的做法：只看表，不看部署 —— 一台机器没配音色是它自己的
+        #    状态，由 ready:false 如实播报，不该在导入时炸掉插件）。
+        try:
+            speech_module.check_voices(())
+            check(False, "语音能力至少要有一个音色")
+        except ValueError as exc:
+            check(str(exc) == "语音能力至少要有一个音色",
+                  f"空音色表的装配期断言要报这一句, 得到 {exc}")
+        try:
+            speech_module.check_voices(({"id": "vivian"}, {"id": "vivian"}))
+            check(False, "音色 id 不许重复（装配期）")
+        except ValueError as exc:
+            check("出现了两次" in str(exc), f"重复的音色要在装配期就报, 得到 {exc}")
+
+        # ② 规则：一条、签名由模态拼出、要的是 text 而**不是 prompt**。
+        entry = speech_module.rule_entry()
+        # 这一条放在最前面是**故意的**：模态写成 img 的后果不是"少了一条规则"，而是
+        # **与图片侧那条纯文生图撞名**（`txt-2-img`）—— 客户端按 signature 配槽，撞名
+        # 意味着它会把语音请求交给画图那一路。撞名会同时把下面两条判据也撞红，所以
+        # 只有让这条先说话，那句最有信息量的诊断才轮得到。
+        check(speech_module.RULE not in capabilities.RULES,
+              f"语音的规则名不许与图片侧撞名, 得到 {speech_module.RULE}")
+        check(entry["signature"] == capabilities.join_rule(("txt",), "sph"),
+              "签名不许手写 —— 它必须是模态拼出来的那一个")
+        check(entry["rule"] == "txt-2-sph" and entry["signature"] == entry["rule"],
+              f"语音只有一条规则, 且签名由模态拼出, 得到 {entry['rule']}")
+        check(entry["needs"] == {"text": True}, f"要的是 text, 得到 {entry['needs']}")
+        check("prompt" not in entry,
+              "语音的规则条目里不许出现 prompt —— 那个键就是翻译的开关")
+
+        # ③ 没有引擎地址 ⇒ 能力如实说 not ready，而不是假装能念。
+        forget_settings()
+        offline = speech_module.describe()
+        check(offline["abilities"][0]["ready"] is False
+              and offline["abilities"][0]["missing"] == ["url"],
+              f"没配地址要 ready:false / missing:url, 得到 {offline['abilities'][0]}")
+
+        # ④ 配好之后：九个音色、顺序就是设置里那份、采样率与流式如实播报。
+        write_settings(speech={"url": ENGINE_URL, "token": ENGINE_TOKEN})
+        config = settings.speech()
+        check(config["available"] is True and config["token"] == ENGINE_TOKEN,
+              f"地址与令牌都要从设置里读出来, 得到 {config}")
+        ability = speech_module.describe()["abilities"][0]
+        check(ability["ready"] is True, f"配好了要 ready, 得到 {ability}")
+        check([item["id"] for item in ability["voices"]] == list(settings.DEFAULT_VOICES),
+              f"九个音色, 顺序等于设置里那份, 得到 {[i['id'] for i in ability['voices']]}")
+        check(ability["audio"] == {"sample_rate": 24000, "channels": 1,
+                                   "formats": ["pcm", "wav"], "streaming": True},
+              f"audio 是这份能力自己的输出规格, 得到 {ability['audio']}")
+        check(ability["files"]["engine"] == settings.DEFAULT_SPEECH_ENGINE,
+              "引擎的模型文件名只进 files.engine —— 那是可播报的事实")
+
+        # ⑤ 文档：九个顶层键、八个 endpoint，而**引擎的地址与令牌不在里面任何角落**。
+        document = document_of()
+        check(set(document) - TOP_LEVEL_KEYS == {"errors"},
+              f"九个规范键, 规范之外只许 errors, 得到 {sorted(set(document) - TOP_LEVEL_KEYS)}")
+        check(document["endpoints"]["speech"] == "/chp/speech", "语音地址必须从文档里读")
+        # 这是一处**段与段的接口**：规则条目的 input 与 speech 段里那份 schema。客户端
+        # 按 input 去取值，指空了不会有任何报错 —— 它只是永远拿不到 schema（静默失效）。
+        spoken = document["speech"]
+        check(spoken["rules"][0]["input"] in spoken["input_schemas"],
+              f"规则条目 input 指向的 schema 必须在 speech 段里, 得到 {spoken['rules'][0]['input']}")
+        check(set(spoken["input_schemas"]) == {spoken["rules"][0]["input"]},
+              f"语音段里就这一份 schema, 得到 {sorted(spoken['input_schemas'])}")
+        check(spoken["input_schemas"][spoken["rules"][0]["input"]]["required"] == ["text", "voice"],
+              "schema 里 voice 是必填 —— 客户端应当总是发它（对省略宽容是服务端的事）")
+        published = json.dumps(document, ensure_ascii=False)
+        check(ENGINE_URL not in published, "引擎地址不许出现在文档里")
+        check(ENGINE_TOKEN not in published, "引擎令牌也不许出现在文档里")
+        # 加法不许碰旧表：把 speech 段摘掉之后，图片侧三张表必须逐字段相同。
+        without = document_of(speech=None)
+        check(document["rules"] == without["rules"]
+              and document["abilities"] == without["abilities"]
+              and document["input_schemas"] == without["input_schemas"],
+              "加了语音段之后, 图片那三张表必须一个字段都没变")
+        check("speech" not in without, "不传就没有这个键")
+
+        # ⑥ 播报过滤：没有 speak 授权的 key 看到**三张空表**，而不是缺键。
+        #    这两件事必须分得开：缺键是"这个插件不会说话"（老插件），空表是"你不能说话"。
+        check(speech_module.describe({"fast"}) == {"rules": [], "abilities": [], "input_schemas": {}},
+              f"没有 speak 授权 ⇒ 三张空表, 得到 {speech_module.describe({'fast'})}")
+        check(speech_module.describe(None)["rules"] != [], "不传 allowed 就是不过滤")
+        # ⑦ 转发：一次请求、两种形状。公开态（一把钥匙都没配）先走一遍。
+        engine_answers(status=200, chunks=[b"\x00\x01" * 4, b"\x02\x03" * 4])
+        streamed = speech_of({"text": "你好，这是一次测试。", "voice": "vivian", "stream": True})
+        check(getattr(streamed, "headers", {}).get("Content-Type") == "audio/pcm",
+              f"stream:true ⇒ audio/pcm, 得到 {getattr(streamed, 'headers', None)}")
+        check(streamed.headers["X-Sample-Rate"] == "24000",
+              "裸 PCM 不带采样率就没法播")
+        check(streamed.audio == b"\x00\x01" * 4 + b"\x02\x03" * 4,
+              f"分块原样转发, 得到 {streamed.audio!r}")
+        check(streamed.prepared and streamed.finished, "流要 prepare 过、要 write_eof 收尾")
+        call = ENGINE_CALLS[-1]
+        check(call["url"] == f"{ENGINE_URL}/v1/audio/speech",
+              f"地址由设置拼出来, 得到 {call['url']}")
+        check(call["json"]["input"] == "你好，这是一次测试。",
+              f"文本原样进引擎 —— 语音永不翻译, 得到 {call['json'].get('input')}")
+        check(set(call["json"]) <= {"input", "voice", "response_format", "stream",
+                                   "language", "speed"},
+              f"只发该发的, 得到 {sorted(call['json'])}")
+        check("model" not in call["json"], "模型名只用于播报, 不发给引擎")
+        check(call["headers"]["Authorization"] == f"Bearer {ENGINE_TOKEN}",
+              "引擎令牌走头, 只在这台机器与引擎之间")
+
+        # 整包：同一个端点、另一种内容类型（引擎自己的两套说法，白送）。
+        engine_answers(status=200, body=b"RIFF\x00\x00\x00\x00WAVEfmt ")
+        whole = speech_of({"text": "你好", "voice": "vivian", "stream": False})
+        check(whole.headers["Content-Type"] == "audio/wav",
+              f"stream:false ⇒ audio/wav, 得到 {whole.headers}")
+        check(isinstance(whole.body, bytes) and whole.body.startswith(b"RIFF"),
+              f"整包要一次给完整个容器, 得到 {whole.body!r}")
+        check(whole.headers["X-Sample-Rate"] == "24000", "两种形状都带采样率")
+        check(ENGINE_CALLS[-1]["json"]["response_format"] == "wav",
+              "整包默认 WAV 容器（response_format 省略时与 stream 配对）")
+        check(ENGINE_CALLS[-1]["json"]["stream"] is False, "stream 如实转发")
+
+        # ⑧ 省略 voice ⇒ **菜单第一项**，不是写死的那个名字。
+        #    故意把菜单换成 ryan 开头的两份：一条写死 "vivian" 的实现会在这里报红，
+        #    而这正是"默认值是表里的成员"这句话唯一能被证伪的样子。
+        write_settings(speech={"url": ENGINE_URL, "token": ENGINE_TOKEN,
+                               "voices": ["ryan", "vivian"]})
+        engine_answers(status=200, chunks=[b"\x01"])
+        speech_of({"text": "你好"})
+        check(ENGINE_CALLS[-1]["json"].get("voice") == "ryan",
+              f"省略 voice 要取菜单第一项, 得到 {ENGINE_CALLS[-1]['json'].get('voice')}")
+        write_settings(speech={"url": ENGINE_URL, "token": ENGINE_TOKEN})
+
+        # ⑨ 拒绝类：都在**开始写 body 之前**，而且都是 JSON。
+        check(error_code_of(speech_of({"voice": "vivian"})) == "bad_request",
+              "缺 text 要 bad_request")
+        unusual = speech_of({"text": "你好", "voice": "nobody"})
+        check(unusual.status == 400 and error_code_of(unusual) == "unsupported_voice",
+              f"未知音色要 400 unsupported_voice, 得到 {unusual.status} {getattr(unusual, 'payload', None)}")
+        check(unusual.payload["detail"]["voices"] == list(settings.DEFAULT_VOICES),
+              "400 里要把可选的音色带上 —— 否则客户端只能猜")
+        check(error_code_of(speech_of({"text": "你好", "voice": "vivian",
+                                       "response_format": "mp3"})) == "bad_request",
+              "不认识的容器要 bad_request")
+        check(error_code_of(speech_of("不是对象")) == "bad_request", "坏 body 要 bad_request")
+
+        # ⑩ 引擎那一侧的失败：收敛成两个码，**且一个字节的引擎细节都不给客户端**。
+        #    引擎 401/403 与"连不上"对客户端是同一件事（都要运维去改那台机器）⇒ no_engine。
+        engine_answers(status=401, body=f'{{"error":"bad token {ENGINE_TOKEN}"}}'.encode())
+        refused = speech_of({"text": "你好", "voice": "vivian"})
+        check(refused.status == 409 and error_code_of(refused) == "no_engine",
+              f"引擎 401 要收敛成 no_engine, 得到 {refused.status} {getattr(refused, 'payload', None)}")
+        engine_answers(status=503, body=b'{"error":"model still loading"}')
+        broken = speech_of({"text": "你好", "voice": "vivian"})
+        check(broken.status == 502 and error_code_of(broken) == "speech_failed",
+              f"引擎 503 要是 speech_failed, 得到 {broken.status} {getattr(broken, 'payload', None)}")
+
+        # 连不上：这里引擎自己的报错里**就写着地址**，所以下面那条断言是真的。
+        engine_answers(failure=FakeConnectionError(f"Cannot connect to host {ENGINE_URL}"))
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            unreachable = speech_of({"text": "你好", "voice": "vivian"})
+        check(unreachable.status == 409 and error_code_of(unreachable) == "no_engine",
+              f"连不上要 no_engine, 得到 {unreachable.status} {getattr(unreachable, 'payload', None)}")
+        leaked = json.dumps([getattr(item, "payload", None) for item in (unreachable, refused, broken)],
+                            ensure_ascii=False)
+        check(ENGINE_URL not in leaked, f"失败响应里不许有引擎地址, 得到 {leaked}")
+        check(ENGINE_TOKEN not in leaked, f"失败响应里不许有引擎令牌, 得到 {leaked}")
+        check(ENGINE_URL in log.getvalue(),
+              f"明细要进那台机器的日志, 否则运维无从下手: {log.getvalue()!r}")
+
+        # ⑪ 没配引擎地址 ⇒ 409 no_engine（在 validate 之后、写 body 之前）。
+        write_settings()
+        check(speech_module.describe()["abilities"][0]["ready"] is False,
+              "清掉设置之后能力又该不 ready")
+        check(error_code_of(speech_of({"text": "你好", "voice": "vivian"})) == "no_engine",
+              "没配引擎地址要 no_engine")
+        write_settings(speech={"url": ENGINE_URL, "token": ENGINE_TOKEN})
+
+        # ⑫ **语音的 text 永不翻译**。这条只有在翻译真的可用时才证得出来，所以先把
+        #    翻译器证明成活的，再证明同一段中文在语音这条路上原样过去了。
+        #    句子要**只属于这里**：翻译记忆是跨检查留着的（它按原文做键），借前面用过的
+        #    句子会让"翻译器活着"这条控制断言被记忆抢先答掉，于是什么都没证明。
+        spoken = "这段中文只属于语音那条路。"
+        write_settings(speech={"url": ENGINE_URL, "token": ENGINE_TOKEN},
+                       translate={"enabled": True, "url": "http://127.0.0.1:8022",
+                                  "model": "qwen3-0.6b"})
+        translator_answers("this sentence belongs to the speech route")
+        moved, translated = asyncio.run(translate.ensure_english(spoken))
+        check(translated is True and moved == "this sentence belongs to the speech route",
+              f"翻译器得先是活的, 否则下面那条断言什么都没证明, 得到 {moved!r}")
+        engine_answers(status=200, chunks=[b"\x01"])
+        speech_of({"text": spoken, "voice": "vivian"})
+        check(ENGINE_CALLS[-1]["json"]["input"] == spoken,
+              f"语音的 text 永不翻译（翻译开着也一样）, 得到 {ENGINE_CALLS[-1]['json'].get('input')}")
+        write_settings(speech={"url": ENGINE_URL, "token": ENGINE_TOKEN})
+
+        # ⑬ 两层门，与图片侧同一道：错钥匙 401（带 spec），钥匙不够 403（承重）。
+        write_keys(key_entry("k-fast", ["fast"]))
+        refused_key = speech_of({"text": "你好", "voice": "vivian"})
+        check(refused_key.status == 401 and refused_key.payload.get("spec") == capabilities.SPEC,
+              f"没带钥匙要 401 且带 spec, 得到 {refused_key.status} {refused_key.payload}")
+        forbidden = speech_of({"text": "你好", "voice": "vivian"},
+                              headers={"Authorization": "Bearer k-fast"})
+        check(forbidden.status == 403 and error_code_of(forbidden) == "forbidden_capability",
+              f"只授权画图的钥匙念不了语音, 得到 {forbidden.status} {getattr(forbidden, 'payload', None)}")
+        check(forbidden.payload["detail"]["category"] == "speak",
+              "403 要点名是哪个 category")
+        # 而授权了 speak 的钥匙照常出声 —— 少了这条，一个"全都拒了"的实现也能全绿。
+        write_keys(key_entry("k-speak", ["speak"]))
+        engine_answers(status=200, chunks=[b"\x01\x02"])
+        audible = speech_of({"text": "你好", "voice": "vivian"},
+                            headers={"Authorization": "Bearer k-speak"})
+        check(getattr(audible, "headers", {}).get("Content-Type") == "audio/pcm",
+              "授权了 speak 的钥匙要能出声")
+        # 默认钥匙（配置节点那个密码 / HAMDRAW_PASSWORD）等价于全部类别 ——
+        # 语音这条路上它也零改动（老卡片把密码写在 chp_params 里）。
+        settings.update(password="pw-under-test")
+        forget_keys()
+        engine_answers(status=200, chunks=[b"\x01\x02"])
+        legacy = speech_of({"text": "你好", "voice": "vivian",
+                            "chp_params": {"password": "pw-under-test"}})
+        check(getattr(legacy, "headers", {}).get("Content-Type") == "audio/pcm",
+              "默认钥匙从字段里来也要能念")
+        check(ENGINE_CALLS[-1]["json"] == {"input": "你好", "voice": "vivian",
+                                          "response_format": "pcm", "stream": True},
+              f"chp_params 不许进引擎的请求体, 得到 {ENGINE_CALLS[-1]['json']}")
+    finally:
+        forget_keys()
+        forget_settings()
+        ENGINE.clear()
+        ENGINE_CALLS.clear()
+
+
 def check_output_urls() -> None:
     """输出地址就是文档里公布的那条模板 —— 客户端不必自己拼。"""
     entry = {"outputs": {"9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"},
@@ -1679,7 +2079,7 @@ def check_routes() -> None:
                     ("/info", "/jobs/{job_id}", "/jobs/{job_id}/progress",
                      "/jobs/{job_id}/output/{index}")}
     expected_post = {f"{server.API_ROOT}{suffix}" for suffix in
-                     ("/jobs", "/jobs/{job_id}/cancel", "/translate")}
+                     ("/jobs", "/jobs/{job_id}/cancel", "/translate", "/speech")}
     check(FAKE_SERVER.routes.registered["GET"] == expected_get,
           f"GET 路由不对: {sorted(FAKE_SERVER.routes.registered['GET'])}")
     check(FAKE_SERVER.routes.registered["POST"] == expected_post,
@@ -1723,6 +2123,7 @@ def main() -> None:
     # 才会报在这一组**点名**的断言上，而不是被一句 helper 的通用文案盖过去。
     check_key_authorization()
     check_document_filtering_is_one_pass()
+    check_speech()
     check_request_channels()
     check_request_ext_defaults()
     check_request_accelerator()
@@ -1740,11 +2141,14 @@ def main() -> None:
     # ``rules`` 是**每个类别**一条（同一个规则的类别共用一条规则串），所以这里两个数都报：
     # 只报类别数会让人以为规则数跟着类别数走，而这正是本轮要拆开的两件事。
     rule_kinds = sorted({str(entry["rule"]) for entry in document["rules"]})
+    voices = document["speech"]["abilities"][0]["voices"]
     print(f"test_spec.py: ok ({len(rule_kinds)} 条规则 {rule_kinds},"
           f"{len(document['rules'])} 个类别,"
           f"{len(document['abilities'])} 条能力,"
           f"{sum(len(item['frames']) for item in document['abilities'])} 帧,"
           f"{len(document['input_schemas'])} 份输入 schema,"
+          f"语音 {document['speech']['rules'][0]['rule']} 带 {len(voices)} 个音色,"
+          f"{len(document['endpoints'])} 个 endpoint,"
           f"{translate.memory_size()} 条翻译记忆,"
           f"插件 {document['plugin']['id']} {document['plugin']['version']},"
           f"根 {server.API_ROOT}, 契约 {document['spec']})")

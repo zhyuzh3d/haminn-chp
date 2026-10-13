@@ -430,6 +430,8 @@ CHP 是一套**本机模型能力接口规范**，面向“把画布交给后端
 4. **`audio` 是这份能力自己的输出规格**，客户端**读它、不猜它**。
 5. **`files.engine` 用引擎自己的模型文件名**，与图片侧 `files.checkpoint` 同一个位置、同一个道理。
 
+**语音那份请求 schema 装在 `speech.input_schemas` 里**，键就是规则条目的 `input`（`txt-2-sph/v1`）—— 与图片侧同一条规矩（§4.1「同一规则共用一份 schema」、§4.3「`input` 指向 `input_schemas` 的键」），只是这一份与 `speech` 自己的两张表放在一起。**顶层那个 `input_schemas` 仍然只有图片侧那三份**：加语音段不许碰旧表 —— 图片侧那三张表（`rules` / `abilities` / `input_schemas`）的**字节与升级前相同**。
+
 **字段名是 `text` 而不是 `prompt`（承重）**：`prompt` 在 CHP 里带副作用 —— `rules[].prompt.language` 为 `"en"` 会让服务端在提交路径上**自动翻译**，把中文念成英文。**`speech` 的文本永不翻译**，这一句是规则，不是建议。`text` 还与模态名 `txt` 同字，符合既有构词法。
 
 **传输：一条路由，`stream` 决定内容类型，不套作业模型。**

@@ -23,6 +23,9 @@ QWEN = "hamdraw_chp/families/qwen_image.py"
 #: 找不到就静默 SKIP，而 SKIP 与 CAUGHT 在退出码上看不出区别。
 INPROC = "hamdraw_chp/backends/comfy_inproc.py"
 KEYS = "hamdraw_chp/keys.py"
+#: 语音那一段的判据大多住在 speech.py 里 —— 变异必须跟着它走（锚点找不到就是 SKIP，
+#: 而 SKIP 与 CAUGHT 在退出码上分不出来）。
+SPEECH = "hamdraw_chp/speech.py"
 
 #: 变异会把某一处改坏, 而"改坏"的一种样子就是让某条路径变成死等。没有上限的话
 #: 一次死等就把整个脚本拖住, 读的人分不清"它在跑"和"它卡住了"。
@@ -309,7 +312,7 @@ MUTATIONS = [
         CAPABILITIES,
         '    "cancel": f"{API_ROOT}/jobs/{{job_id}}/cancel",\n',
         "",
-        "endpoints 七个键",
+        "endpoints 八个键",
     ),
     # --- 提交幂等键 ------------------------------------------------------ #
     (
@@ -485,6 +488,150 @@ MUTATIONS = [
         '            if token and keys_module.matches(token, default):',
         '            import hmac as _hmac\n            if token and _hmac.compare_digest(token, default):',
         "中文默认密码也要能进门",
+    ),
+    # --- 语音（第九个顶层键） --------------------------------------------- #
+    (
+        # 顶层键少了第九个：客户端会以为这个插件不会说话（而那正是老插件的长相）。
+        "文档少了 speech 段（语音能力凭空消失）",
+        CAPABILITIES,
+        '        payload["speech"] = deepcopy(speech)',
+        '        payload["speech_"] = deepcopy(speech)',
+        "九个规范键",
+    ),
+    (
+        # 键数由上面那条变异守着（它删 cancel），这一条守的是**值**：文档里播报的地址
+        # 必须就是真注册的那一条 —— 两个都对不上的话，客户端按文档去请求会撞 404。
+        "endpoints 里的语音地址不是注册的那一条",
+        CAPABILITIES,
+        '    "speech": f"{API_ROOT}/speech",',
+        '    "speech": f"{API_ROOT}/voice",',
+        "语音地址必须从文档里读",
+    ),
+    (
+        "语音的模态写成 img（与图片侧那条纯文生图撞名）",
+        SPEECH,
+        'OUTPUT = "sph"',
+        'OUTPUT = "img"',
+        "语音的规则名不许与图片侧撞名",
+    ),
+    (
+        # 段与段的接口那一端：`input` 与它指的键写成两个不一样的名字（`/v1` 漏一个就够）。
+        # 客户端拿 input 去 speech.input_schemas 里取值会取空，而**不会有任何报错**。
+        "规则条目 input 与 schema 的键对不上（客户端取到空 schema）",
+        SPEECH,
+        '        "input": SCHEMA_KEY,',
+        '        "input": RULE,',
+        "规则条目 input 指向的 schema 必须在 speech 段里",
+    ),
+    (
+        # 同一条接口的另一端：schema 那一头整份不给了。
+        "语音段不再播报 input_schemas（有规则、有音色，却没有请求体长什么样）",
+        SPEECH,
+        '        "input_schemas": {SCHEMA_KEY: schema()},',
+        '        "input_schemas": {},',
+        "规则条目 input 指向的 schema 必须在 speech 段里",
+    ),
+    (
+        "schema 里 voice 不必填（客户端以为可以省略，而这不是服务的承诺）",
+        SPEECH,
+        '        "required": [TEXT_FIELD, "voice"],',
+        '        "required": [TEXT_FIELD],',
+        "schema 里 voice 是必填",
+    ),
+    (
+        "规则条目里手写一份 signature（不再由模态拼出）",
+        SPEECH,
+        '        "signature": RULE,          # 与图片侧同一个不变量：由模态拼出来的名字就是规则名',
+        '        "signature": "hand-written-2-sph",',
+        "签名不许手写",
+    ),
+    (
+        "空音色表也不再报（客户端拿到一条点不动的选项）",
+        SPEECH,
+        '    if not entries:\n        raise ValueError("语音能力至少要有一个音色")',
+        '    if False:\n        raise ValueError("语音能力至少要有一个音色")',
+        "语音能力至少要有一个音色",
+    ),
+    (
+        "音色 id 重复也不报（两个音色同名）",
+        SPEECH,
+        '        if name in seen:\n            raise ValueError(f"音色 {name} 出现了两次")',
+        '        if False:\n            raise ValueError(f"音色 {name} 出现了两次")',
+        "音色 id 不许重复",
+    ),
+    (
+        "默认音色写死成一个名字（而不是菜单第一项）",
+        SPEECH,
+        '        voice = menu[0] if menu else ""',
+        '        voice = "vivian"',
+        "省略 voice 要取菜单第一项",
+    ),
+    (
+        "音色成员校验放宽成「非空字符串即可」",
+        SPEECH,
+        '    if voice not in menu:\n        raise SpeechError("unsupported_voice",',
+        '    if not voice:\n        raise SpeechError("unsupported_voice",',
+        "未知音色要 400 unsupported_voice",
+    ),
+    (
+        "整包也回 audio/pcm（两种形状一种容器）",
+        SPEECH,
+        'AUDIO_TYPES = {"pcm": "audio/pcm", "wav": "audio/wav"}',
+        'AUDIO_TYPES = {"pcm": "audio/pcm", "wav": "audio/pcm"}',
+        "stream:false ⇒ audio/wav",
+    ),
+    (
+        # 省略 response_format 时该按 stream 配对。这条**由前一句抓住**（内容类型先变红）
+        # —— 两条断言守的是同一个洞的两端，写在这里是为了让"整包也当裸 PCM"这条
+        # 意图有一个按名字的东西指着它。
+        "省略 response_format 不再与 stream 配对（整包也当裸 PCM）",
+        SPEECH,
+        '    default_format = STREAM_FORMAT if stream else WHOLE_FORMAT',
+        '    default_format = STREAM_FORMAT',
+        "stream:false ⇒ audio/wav",
+    ),
+    (
+        # 泄露的两种最现实的样子：把 url 塞进文档，或把引擎原话塞进响应。
+        "引擎地址塞进 speech.abilities[].files（文档泄露内网地址）",
+        SPEECH,
+        '        "files": {"engine": str(config["engine"])},',
+        '        "files": {"engine": str(config["engine"]), "url": str(config["url"])},',
+        "引擎地址不许出现在文档里",
+    ),
+    (
+        # 泄露最现实的样子：**码还是对的**，但把引擎的原话当成给用户看的那句话。
+        # 所以这条变异必须保住 no_engine，否则先红的会变成"码不对"，而"有没有漏"
+        # 那条断言根本没机会说话 —— 那样它就成了一条永远轮不到的摆设。
+        "引擎原话透传给客户端（码对、话里带着它与引擎之间的一切）",
+        SPEECH,
+        '                    _log_failure(url, f"HTTP {answer.status} {detail}")\n'
+        '                    raise failure_of(answer.status)',
+        '                    _log_failure(url, f"HTTP {answer.status} {detail}")\n'
+        '                    raise SpeechError(failure_of(answer.status).code, detail)',
+        "失败响应里不许有引擎令牌",
+    ),
+    (
+        "语音段不按 key 过滤（不能说话的 key 也拿到整段）",
+        SPEECH,
+        '    if allowed is not None and CATEGORY not in allowed:',
+        '    if False:',
+        "没有 speak 授权 ⇒ 三张空表",
+    ),
+    (
+        # 「read 了但没用」的经典形态：先校验，再**顺手**把文本译一遍。
+        "语音的文本也过一遍翻译（中文被念成英文）",
+        SERVER,
+        '        fields = speech_module.validate(body)\n',
+        '        fields = speech_module.validate(body)\n'
+        '        fields["text"] = (await translate_module.ensure_english(fields["text"]))[0]\n',
+        "语音的 text 永不翻译",
+    ),
+    (
+        "语音这条路由不进执行层校验（只靠界面藏起来）",
+        SERVER,
+        '    if not keys_module.permits(record, speech_module.CATEGORY):',
+        '    if False:',
+        "只授权画图的钥匙念不了语音",
     ),
 ]
 
