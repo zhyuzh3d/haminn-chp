@@ -46,6 +46,7 @@ import inspect
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import types
@@ -69,14 +70,21 @@ class FakeResponse:
 
     ``body`` is the one thing ``/chp/speech`` needs that the JSON answers never
     did: the whole-file shape answers with raw audio bytes rather than a document.
+    ``text`` / ``content_type`` are the console page's half — it is the only
+    handler that answers with HTML, and a test that could not see the content type
+    could not tell the page from a stray JSON error.
     """
 
     def __init__(self, payload: Any = None, status: int = 200, *,
-                 body: Any = None, headers: dict[str, str] | None = None) -> None:
+                 body: Any = None, headers: dict[str, str] | None = None,
+                 text: Any = None, content_type: Any = None, charset: Any = None) -> None:
         self.payload = payload
         self.status = status
         self.body = body
         self.headers = dict(headers or {})
+        self.text = text
+        self.content_type = content_type
+        self.charset = charset
 
 
 class FakeStreamResponse:
@@ -175,11 +183,14 @@ class FakeSession:
         return FakeUpstream(**{key: value for key, value in answers.items() if key != "failure"})
 
 
-def _json_response(payload: Any, status: int = 200, dumps: Any = None) -> FakeResponse:
+def _json_response(payload: Any, status: int = 200, dumps: Any = None,
+                   headers: dict[str, str] | None = None) -> FakeResponse:
     # Round-tripping through text is deliberate: it is also the proof that the
     # document really is plain JSON and not a dict that merely looks like one.
+    # ``headers`` 是控制台那一半要的：它的 401 带 ``WWW-Authenticate``（浏览器靠它
+    # 弹登录框），而数据面的 401 不带。两边的失败形状要判得开，就得看得见响应头。
     text = (dumps or (lambda value: json.dumps(value)))(payload)
-    return FakeResponse(json.loads(text), status)
+    return FakeResponse(json.loads(text), status, headers=headers)
 
 
 # translate.py imports aiohttp at module scope; server.py needs aiohttp.web for
@@ -222,10 +233,13 @@ os.environ["HAMDRAW_SETTINGS"] = str(_SCRATCH / "hamdraw_settings.json")
 #: without it, running this file on a machine that really has a ``chp_keys.json``
 #: next to the package would silently change what "no keys configured" means.
 os.environ["HAMDRAW_KEYS"] = str(_SCRATCH / "chp_keys.json")
+#: 同一个理由，控制台凭据也指到 scratch：真机上那份 ``chp_admin.json`` 若被读到，
+#: "默认凭据能登录"这条判据就变成了"这台机器的凭据是什么"，而那不是被测的东西。
+os.environ["HAMDRAW_ADMIN"] = str(_SCRATCH / "chp_admin.json")
 for _name in ("HAMDRAW_PASSWORD", "HAMDRAW_TRANSLATE_URL", "HAMDRAW_TRANSLATE_MODEL"):
     os.environ.pop(_name, None)
 
-from hamdraw_chp import backends, capabilities, families, keys, server, settings, speech as speech_module, translate, version  # noqa: E402
+from hamdraw_chp import admin, backends, capabilities, families, keys, server, settings, speech as speech_module, translate, version  # noqa: E402
 
 
 def check(condition: bool, message: str) -> None:
@@ -961,7 +975,7 @@ class FakeQueue:
 
 class FakeRoutes:
     def __init__(self) -> None:
-        self.registered: dict[str, set[str]] = {"GET": set(), "POST": set()}
+        self.registered: dict[str, set[str]] = {"GET": set(), "POST": set(), "DELETE": set()}
 
     def get(self, path: str):
         self.registered["GET"].add(path)
@@ -969,6 +983,10 @@ class FakeRoutes:
 
     def post(self, path: str):
         self.registered["POST"].add(path)
+        return lambda handler: handler
+
+    def delete(self, path: str):
+        self.registered["DELETE"].add(path)
         return lambda handler: handler
 
 
@@ -2017,6 +2035,279 @@ def check_output_urls() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# the console (S4)
+# --------------------------------------------------------------------------- #
+
+#: 控制台凭据的默认值。README 里也写着这一对 —— 「没写文件时用代码里的默认值」只有在
+#: 默认值本身是被公开承诺的时候才成立，所以这里引常量，不引字面量。
+ADMIN_AUTH = "Basic " + base64.b64encode(
+    f"{admin.DEFAULT_USER}:{admin.DEFAULT_PASSWORD}".encode("utf-8")).decode("ascii")
+
+
+def basic_auth(user: str, password: str) -> str:
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+
+
+def write_admin(user: Any = None, password: Any = None) -> None:
+    """写一份 ``chp_admin.json``；两个都不给 = 让它不存在（也就是用默认值）。"""
+    target = admin.path()
+    if user is None and password is None:
+        target.unlink(missing_ok=True)
+        return
+    target.write_text(json.dumps({"schema": admin.SCHEMA, "user": user, "password": password},
+                                 ensure_ascii=False), encoding="utf-8")
+
+
+def forget_admin() -> None:
+    """回到「这台机器没写过 chp_admin.json，而且进程刚起来」的状态。"""
+    admin.forget()
+    admin.path().unlink(missing_ok=True)
+    admin.path().with_name(admin.path().name + ".tmp").unlink(missing_ok=True)
+
+
+def admin_call(handler: Any, body: Any = None, headers: dict[str, str] | None = None,
+               match_info: dict[str, str] | None = None) -> Any:
+    return asyncio.run(handler(FakeRequest(body, headers or {}, match_info or {})))
+
+
+def admin_ok(handler: Any, body: Any = None, match_info: dict[str, str] | None = None) -> Any:
+    """一次带对凭据的调用 —— 每条用例只写它在测的那个字段。"""
+    return admin_call(handler, body, {"Authorization": ADMIN_AUTH}, match_info)
+
+
+def check_admin() -> None:
+    """S4：管理面。五条判据，外加"两条线不许互认"那几条。"""
+    forget_admin()
+    forget_keys()
+    try:
+        # ① 默认凭据能登录，而且**只有 Basic**。数据面的那把钥匙进不了这道门：
+        #    两条线共用一把钥匙的话，"数据面 key 泄漏"就升级成"能给自己造 key"。
+        record = admin.load()
+        check((record["user"], record["password"]) == (admin.DEFAULT_USER, admin.DEFAULT_PASSWORD),
+              f"没写文件时要用代码里的默认值, 得到 {record}")
+        check(record["source"] == "default",
+              "控制台凭据的默认值来自代码、不是来自 key 表 —— 来源要说出来")
+        check(admin.authenticates(ADMIN_AUTH), "默认凭据必须能进门")
+        check(not admin.authenticates(basic_auth(admin.DEFAULT_USER, "wrong")), "密码错了要拒")
+        check(not admin.authenticates(basic_auth("nobody", admin.DEFAULT_PASSWORD)),
+              "用户名错了也要拒")
+        # **换 scheme 也不行** —— 这一条与上面那句不一样：上面那句发的是裸密码，随便哪种
+        # 解析器都解不开，所以它不是判据。这里发的是**一份合法的 Basic 载荷换了前缀**：
+        # 只有"真的检查 scheme"的实现才拒得掉，而"数据面 key 当控制台凭据用"正是这条路。
+        check(not admin.authenticates("Bearer " + ADMIN_AUTH[len("Basic "):]),
+              "数据面的载体（Bearer）不许当控制台凭据 —— 同一份凭据换个 scheme 也不行")
+        check(not admin.authenticates(""), "没有凭据就是没进门")
+        check(not admin.authenticates("Basic " + base64.b64encode(b"\xff\xfe").decode("ascii")),
+              "解不开的 Basic 头要当成没凭据，而不是崩掉")
+
+        # ② 两种 401 必须长得不一样：控制台让浏览器弹登录框、且**不带 spec**
+        #    （它不是协议的一部分）；数据面反过来 —— 它的 spec 是给客户端分辨
+        #    "地址错还是钥匙错"用的，而它不弹登录框。
+        refused = admin_call(server.admin_page, headers={})
+        check(refused.status == 401, f"没凭据时页面要 401, 得到 {refused.status}")
+        check(str(refused.headers.get("WWW-Authenticate") or "").startswith("Basic"),
+              "控制台的 401 要带 WWW-Authenticate —— 页面因此不必自己带登录表单")
+        check("spec" not in refused.payload,
+              f"控制台不是协议的一部分, 401 里不许有 spec, 得到 {refused.payload}")
+        write_keys(key_entry("k-fast-only", ["fast"]))
+        data_refused = info_with({"Authorization": "Bearer nope"})
+        check(data_refused.status == 401 and data_refused.payload.get("spec") == "chp/2",
+              f"数据面的 401 要带 spec, 得到 {data_refused.payload}")
+        check("WWW-Authenticate" not in data_refused.headers,
+              "数据面的 401 不该让浏览器弹登录框")
+        forget_keys()
+
+        # ③ 页面：纯静态 HTML，**改凭据的入口一个都没有** —— 连凭据文件的名字都不出现，
+        #    它唯一会去调的就是控制台自己的那几条路由。
+        page = admin_ok(server.admin_page)
+        check(page.status == 200 and page.content_type == "text/html",
+              f"页面要是 HTML, 得到 {page.content_type} / {page.status}")
+        html = str(page.text or "")
+        check(html.strip().startswith("<!DOCTYPE html"), "页面就是一份静态 HTML, 不引构建链")
+        check("password" not in html.lower() and "chp_admin" not in html,
+              "页面上不许有任何改凭据的入口（连那个文件的名字都不该出现）")
+        mentioned = set(re.findall(r"/chp/[A-Za-z0-9/_.-]*", html))
+        allowed = {admin.ADMIN_ROOT, admin.PAGE_PATH, admin.CAPABILITIES_PATH, admin.KEYS_PATH,
+                   admin.KEYS_PATH + "/"}
+        check(mentioned <= allowed,
+              f"页面只能调控制台自己那几条路由, 多出 {sorted(mentioned - allowed)}")
+        check(admin.KEYS_PATH in mentioned and admin.CAPABILITIES_PATH in mentioned,
+              f"页面要真的读能力清单与 key 表, 得到 {sorted(mentioned)}")
+
+        # ④ 能力清单是**只读的代码注册表**（图片五个 category + 语音那一个），
+        #    它的 ready/missing 与 /chp/info 同源 —— 两边不一致会让管理员去找一个
+        #    不存在的配置问题。
+        forget_settings()
+        rows = admin_ok(server.admin_capabilities).payload
+        # 先判**授权域**本身，再判页面清单。反过来排的话，"授权域少一个 speak"会先撞在
+        # "清单与授权域不一致"上 —— 那也对，但那句诊断指向的是"两边不一样"，而真正要
+        # 让人看见的是"语音授不出来"。
+        check(admin.categories() == [*capabilities.categories(), speech_module.CATEGORY],
+              f"图片侧五个 + speak, 得到 {admin.categories()}")
+        check([row["category"] for row in rows] == admin.categories(),
+              f"清单就是注册表, 得到 {[row['category'] for row in rows]}")
+        check(rows[-1]["source"] == "speech" and rows[-1]["rule"] == "txt-2-sph",
+              f"最后一个要说得出它是语音, 得到 {rows[-1]}")
+        for row in rows:
+            if row["source"] == "image":
+                same = server._abilities_of(row["category"])
+                check((row["ready"], row["missing"]) == (bool(same["ready"]),
+                                                         list(same["missing"])),
+                      f"控制台与 /chp/info 必须同源, {row['category']} 上不一致")
+        broken = {row["category"]: row for row in rows}
+        check(broken["render"]["ready"] is False and broken["render"]["missing"],
+              f"没配过模型时要说得出缺什么, 得到 {broken['render']}")
+        use_render()
+        fixed = {row["category"]: row for row in admin_ok(server.admin_capabilities).payload}
+        check(fixed["render"]["ready"] is True and not fixed["render"]["missing"],
+              f"配齐三件套之后 render 就是就绪的, 得到 {fixed['render']}")
+
+        # ⑤ 清单外的 category **一律拒收**（与数据面 unsupported_category 同一条纪律），
+        #    而且拒得干净：被拒的提交不许在表里留下半行。
+        forget_settings()
+        refused = admin_ok(server.admin_keys_create,
+                           {"label": "越权", "categories": ["fast", "nope"]})
+        check(refused.status == 400 and refused.payload["error"] == "unsupported_category",
+              f"清单外的 category 要拒收, 得到 {refused.status} {refused.payload}")
+        check(refused.payload["detail"]["unknown"] == ["nope"], "要说是哪一个不认识")
+        check(keys.read() == [], "被拒的提交不许留下任何东西")
+        refused = admin_ok(server.admin_keys_create, {"label": "不是数组", "categories": "fast"})
+        check(refused.payload["error"] == "bad_request", "categories 不是数组也是坏请求")
+
+        # ⑥ 建一把真的：id / key / created 都要有，而且**数据面立刻按它判**
+        #    （热生效 —— 表是每次请求重读的，与"改凭据要重启"正好相反）。
+        made = admin_ok(server.admin_keys_create,
+                        {"label": "A1X 上的 Chataxi", "categories": ["fast", "speak"]})
+        check(made.status == 201, f"新建要 201, 得到 {made.status} {made.payload}")
+        entry = made.payload
+        check(str(entry["id"]).startswith(admin.ID_PREFIX) and entry["key"] and entry["created"],
+              f"新建的条目要有 id / key / created, 得到 {entry}")
+        check(entry["categories"] == ["fast", "speak"], f"授权要原样存下, 得到 {entry}")
+        check(keys.resolve(entry["key"]) is not None, "新 key 必须立刻能用（热生效）")
+        check(keys.permits(keys.resolve(entry["key"]), "speak"),
+              "授权了 speak 就要真的能念")
+        check(not keys.permits(keys.resolve(entry["key"]), "generate"),
+              "没授权 generate 就是不能画 —— 执行层说了算")
+        listed = admin_ok(server.admin_keys_list).payload
+        check([row["key"] for row in listed] == [entry["key"]],
+              f"表里就是刚建的那一把, 得到 {listed}")
+        check(all(row["source"] == "table" for row in listed),
+              "没有默认钥匙时表里只有表自己的条目")
+
+        # ⑦ 默认 key 在控制台里**只读显示、且不显示它的值**：它是真钥匙，能看见它存在，
+        #    但那个文件不是控制台能写的，把它印到页面上只会多一处泄漏面。
+        settings.update(password="pw-default-under-test")
+        listed = admin_ok(server.admin_keys_list).payload
+        default = [row for row in listed if row["source"] == "default"]
+        check(len(default) == 1 and default[0]["categories"] == ["*"],
+              f"默认钥匙要只读地出现一次、权限是全部, 得到 {listed}")
+        check(default[0]["key"] == "", "默认钥匙的值不许出现在控制台里")
+        check(default[0]["id"] == "", "默认钥匙没有 id —— 它不在 key 表里")
+        forget_settings()
+
+        # ⑧ 改与删：按 id 寻址（钥匙本身永不进 URL），改完立刻生效。
+        changed = admin_ok(server.admin_key_update, {"label": "改过的标签", "categories": ["fast"]},
+                           {"key_id": entry["id"]})
+        check(changed.payload["label"] == "改过的标签" and changed.payload["categories"] == ["fast"],
+              f"改标签与授权要落盘, 得到 {changed.payload}")
+        check(changed.payload["key"] == entry["key"], "没要求换钥匙就不许换")
+        check(keys.permits(keys.resolve(entry["key"]), "speak") is False,
+              "撤掉 speak 之后立刻就不能念了")
+        swapped = admin_ok(server.admin_key_update, {"regenerate": True}, {"key_id": entry["id"]})
+        check(swapped.payload["key"] != entry["key"], "要求换一把就得换一把")
+        check(keys.resolve(entry["key"]) is None, "旧钥匙立刻失效")
+        check(keys.resolve(swapped.payload["key"]) is not None, "新钥匙立刻能用")
+        check(swapped.payload["categories"] == ["fast"], "换钥匙不许顺带改授权")
+        missing = admin_ok(server.admin_key_update, {"label": "x"}, {"key_id": "k_nobody"})
+        check(missing.status == 404, f"没有这个 id 要 404, 得到 {missing.status}")
+        gone = admin_ok(server.admin_key_delete, None, {"key_id": entry["id"]})
+        check(gone.status == 200 and keys.read() == [], "删掉之后表要真的空了")
+        check(admin_ok(server.admin_key_delete, None, {"key_id": entry["id"]}).status == 404,
+              "再删一次要 404，不是静默成功")
+
+        # ⑨ 表里的 key 不许与控制台凭据同值：数据面也认 Basic（取 `:` 之后那段当 key），
+        #    同值就意味着"控制台密码顺带成了数据面钥匙"。
+        for candidate in (admin.DEFAULT_PASSWORD, admin.DEFAULT_USER):
+            collision = admin_ok(server.admin_keys_create, {"label": "撞了", "key": candidate})
+            check(collision.status == 400
+                  and collision.payload["detail"]["reason"] == "credential_collision",
+                  f"与控制台凭据同值的 key 要拒收, 得到 {collision.payload}")
+        check(keys.read() == [], "撞车的提交也不许留下东西")
+        # 而普通的 key 照常收下。
+        daily = admin_ok(server.admin_keys_create, {"label": "正常", "key": "k-daily-key"})
+        check(daily.status == 201, "正常的值不该被这条规矩挡住")
+        stored = keys.path()
+        # 原子写的一个可观测影子：写完不许留下临时文件。它是代理判据 —— 真正要保的是
+        # "读者要么看到旧表、要么看到新表"（`keys.read` 每个请求都跑），那件事离线测不
+        # 出来；能测的是"走了那条 replace 的路，而不是就地覆盖"。**它排在权限之前**：
+        # 就地覆盖会先留下 .tmp，也会（文件原本不存在时）顺手把权限变成 0644，两条都会
+        # 红 —— 排前面的是诊断更准的那一条。
+        check(not stored.with_name(stored.name + ".tmp").exists(),
+              "写完不许留下 .tmp —— 表是就地替换的，不是就地覆盖的")
+        check(oct(stored.stat().st_mode & 0o777) == "0o600",
+              f"表里装的是凭据, 权限要是 0600, 得到 {oct(stored.stat().st_mode & 0o777)}")
+
+        # ⑩ 改 chp_admin.json 要**重启才生效**（业主口径）：这一份是缓存住的，与 key 表
+        #    的热生效正好相反。`forget()` 就是那次重启。
+        write_admin("someone", "brand-new-password")
+        check(admin.authenticates(ADMIN_AUTH),
+              "换了文件但还没重启 ⇒ 旧凭据照用（这正是「改了要重启」的那一半）")
+        check(not admin.authenticates(basic_auth("someone", "brand-new-password")),
+              "新凭据在重启之前不许生效")
+        admin.forget()
+        fresh = admin.load()
+        check(fresh["source"] == "file" and fresh["user"] == "someone",
+              f"重启之后读文件, 得到 {fresh}")
+        check(admin.authenticates(basic_auth("someone", "brand-new-password")),
+              "重启之后新凭据生效")
+        check(not admin.authenticates(ADMIN_AUTH), "重启之后旧凭据失效")
+        check(admin.authenticates(basic_auth("someone", "brand-new-password")),
+              "同样的凭据问两次都要答是（常量时间比较不该有状态）")
+        # 非 ASCII 凭据也要能进 —— 与数据面同一条教训（hmac 那把刀的另一种握法）。
+        write_admin("管理员", "密码里有个中")
+        admin.forget()
+        check(admin.authenticates(basic_auth("管理员", "密码里有个中")),
+              "控制台凭据也允许是非 ASCII —— Basic 头是真 UTF-8")
+        check(not admin.authenticates(basic_auth("管理员", "别的东西")), "非 ASCII 也要判错")
+        # 写坏的凭据文件不是"谁都进得来"，也不是"谁都被锁在外面"：回默认值。
+        # 两条路都要走一遍 —— 空密码与解不开的 JSON 是两种坏法，而它们落在 `_read` 的
+        # 两个不同分支上（一条走"密码为空"，一条走 `except`）。只测其中一条的话，另一条
+        # 被改成"回一个空凭据"不会有任何人知道。
+        write_admin("x", "")
+        admin.forget()
+        check(admin.load()["source"] == "default", "空密码是写坏了 ⇒ 回默认值")
+        check(admin.authenticates(ADMIN_AUTH), "回默认值之后默认凭据仍然能进")
+        admin.path().write_text("{ 这不是 JSON", encoding="utf-8")
+        admin.forget()
+        broken = admin.load()
+        # 用 `get` 而不是 `[]`：被改成"回一个空凭据"的实现连 `source` 都不给，而
+        # `[]` 会当场 KeyError —— 那不是"这条断言抓住了"，那是它自己塌了，变异脚本
+        # 看到的是另一句话，于是这条变异会报 ESCAPED。
+        check(broken.get("source") == "default"
+              and broken.get("password") == admin.DEFAULT_PASSWORD,
+              f"解不开的凭据文件回默认值（而不是回一个空凭据）, 得到 {broken}")
+        check(admin.authenticates(ADMIN_AUTH), "文件写坏了之后默认凭据仍然能进")
+        check(not admin.authenticates(basic_auth("", "")), "空凭据组合也进不来")
+
+        # ⑪ 路由清单：控制台那一族里没有一条是"改凭据"的，也没有一条落在文档里。
+        check(all(method in {"GET", "POST", "DELETE"} for method, _ in admin.ROUTES),
+              f"清单里的方法只有这三种, 得到 {admin.ROUTES}")
+        check(all(path.startswith(admin.ADMIN_ROOT) for _, path in admin.ROUTES),
+              f"控制台的路由只在 /chp/admin 下, 得到 {admin.ROUTES}")
+        words = "credential password user admin.json secret token".split()
+        check(not any(word in path for _, path in admin.ROUTES for word in words),
+              f"路由表里不许有改凭据的入口, 得到 {admin.ROUTES}")
+        check(not any("chp_admin" in path for _, path in admin.ROUTES),
+              "控制台路由不许提到那个凭据文件")
+        check(set(capabilities.ENDPOINTS.values()).isdisjoint({path for _, path in admin.ROUTES}),
+              "控制台与数据面不许共用同一条路径")
+    finally:
+        forget_settings()
+        forget_keys()
+        forget_admin()
+
+
+# --------------------------------------------------------------------------- #
 # server surface
 # --------------------------------------------------------------------------- #
 
@@ -2080,17 +2371,27 @@ def check_routes() -> None:
                      "/jobs/{job_id}/output/{index}")}
     expected_post = {f"{server.API_ROOT}{suffix}" for suffix in
                      ("/jobs", "/jobs/{job_id}/cancel", "/translate", "/speech")}
-    check(FAKE_SERVER.routes.registered["GET"] == expected_get,
+    # 控制台那一族**独立清点**：它不在 endpoints 里，所以它不是"文档承诺的端点"之一，
+    # 而它偏偏又是真的注册着的 —— 两个清单各写一次，漏一个立刻看得出来。
+    admin_wired = {method: {path for name, path in admin.ROUTES if name == method}
+                   for method in ("GET", "POST", "DELETE")}
+    check(FAKE_SERVER.routes.registered["GET"] == expected_get | admin_wired["GET"],
           f"GET 路由不对: {sorted(FAKE_SERVER.routes.registered['GET'])}")
-    check(FAKE_SERVER.routes.registered["POST"] == expected_post,
+    check(FAKE_SERVER.routes.registered["POST"] == expected_post | admin_wired["POST"],
           f"POST 路由不对: {sorted(FAKE_SERVER.routes.registered['POST'])}")
+    check(FAKE_SERVER.routes.registered["DELETE"] == admin_wired["DELETE"],
+          f"DELETE 路由不对: {sorted(FAKE_SERVER.routes.registered['DELETE'])}")
 
     # 文档里播报的端点必须与实际注册的一致(除了占位符写法)
     for path in capabilities.ENDPOINTS.values():
         check(path in FAKE_SERVER.routes.registered["GET"] or path in FAKE_SERVER.routes.registered["POST"],
               f"文档播报的端点 {path} 没有注册")
+    # 控制台不进文档：没有一条 endpoint 落在 /chp/admin 下面。
+    check(not any(str(path).startswith(admin.ADMIN_ROOT) for path in capabilities.ENDPOINTS.values()),
+          f"控制台不是协议的一部分, 不该进 endpoints: {sorted(capabilities.ENDPOINTS.values())}")
     # 别名根一个都不许注册
-    every = FAKE_SERVER.routes.registered["GET"] | FAKE_SERVER.routes.registered["POST"]
+    every = (FAKE_SERVER.routes.registered["GET"] | FAKE_SERVER.routes.registered["POST"]
+             | FAKE_SERVER.routes.registered["DELETE"])
     check(not any(path.startswith("/cvp") or path.startswith("/hamdraw") for path in every),
           f"/cvp 与 /hamdraw 下面什么都不许服务: {sorted(every)}")
 
@@ -2124,6 +2425,9 @@ def main() -> None:
     check_key_authorization()
     check_document_filtering_is_one_pass()
     check_speech()
+    # 控制台排在数据面那几条之后：它读的是同一张表与同一个注册表，前面的用例刚把
+    # "数据面怎么判"定型；这里判的是**谁有权改那张表**，前提必须是前一组已经成立。
+    check_admin()
     check_request_channels()
     check_request_ext_defaults()
     check_request_accelerator()

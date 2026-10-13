@@ -21,6 +21,19 @@ export is ever needed.  The contract is described in ``plans/chp-spec.md``.
 CHP is the protocol; ``hamdraw_chp`` is one implementation of it.  That is why
 the package, the ``/chp`` root and ``hamdraw_settings.json`` keep their names
 while the prose says "CHP": the protocol was renamed, not the deployment.
+
+Two things were added in 3.2.0 without touching the image side of the contract
+(``spec`` is still ``chp/2``):
+
+* **Speech** — ``POST /chp/speech`` turns text into a voice through the TTS
+  engine already installed on this machine.  It is the one route that is not a
+  job: one request, bytes coming back as they are made (``stream`` picks bare
+  PCM or a whole WAV).  See :mod:`hamdraw_chp.speech`.
+* **A key table and a console** — ``chp_keys.json`` grants each client its own
+  key and its own categories, and the console at ``/chp/admin/`` is the only
+  thing that writes it.  The console is **not part of the contract**: it is
+  deliberately absent from ``endpoints``, because a client reads its addresses
+  from the document.  See :mod:`hamdraw_chp.admin`.
 """
 
 from __future__ import annotations

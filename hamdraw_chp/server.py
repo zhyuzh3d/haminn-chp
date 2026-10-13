@@ -158,6 +158,7 @@ from typing import Any
 
 from aiohttp import web
 
+from . import admin as admin_module
 from . import backends
 from . import capabilities as capabilities_module
 from . import families
@@ -1089,6 +1090,106 @@ async def speech_endpoint(request: web.Request) -> web.StreamResponse:
 
 
 # --------------------------------------------------------------------------- #
+# the console (/chp/admin/*) — a management plane, not part of the contract
+# --------------------------------------------------------------------------- #
+
+def _admin_ok(request: web.Request) -> bool:
+    """Is this the administrator?  **Basic only**, and never through ``_token_of``.
+
+    The data plane reads a ``Basic`` header as "the part after the colon is the
+    key" (``_token_of``), so a console that reused that helper could be opened by
+    a data-plane key — which is the whole reason the two planes have two doors.
+    """
+    return admin_module.authenticates(request.headers.get("Authorization", ""))
+
+
+def _admin_denied() -> web.Response:
+    """401 that a browser understands, and that does **not** look like the data plane's.
+
+    Two deliberate differences from :func:`_unauthorized`: there is no ``spec``
+    (the console is not part of the protocol — §4.9 — so it must not answer in the
+    protocol's shapes), and there is a ``WWW-Authenticate`` header, which is what
+    makes the browser ask for the credential itself instead of the page having to
+    carry a login form.
+    """
+    return web.json_response(
+        {"error": "unauthorized", "message": "需要控制台凭据（用户名与密码）。"},
+        status=401, headers=admin_module.challenge(),
+        dumps=lambda value: json.dumps(value, ensure_ascii=False))
+
+
+def _admin_error(refused: admin_module.AdminError) -> web.Response:
+    return _fail(refused.code, refused.message, detail=refused.detail)
+
+
+async def admin_page(request: web.Request) -> web.Response:
+    """``GET /chp/admin/`` — the static console page."""
+    if not _admin_ok(request):
+        return _admin_denied()
+    try:
+        return web.Response(text=admin_module.page(), content_type="text/html", charset="utf-8")
+    except OSError as trouble:
+        return _fail("internal", f"控制台页面读不到：{trouble}")
+
+
+async def admin_capabilities(request: web.Request) -> web.Response:
+    """``GET /chp/admin/capabilities`` — **read-only**: what the code registered.
+
+    The list *is* ``capabilities.CATEGORY_TABLE`` plus the speech category, and
+    ``ready`` / ``missing`` come from the same callable the discovery document
+    uses.  There is no way to add an entry here: a capability is code.
+    """
+    if not _admin_ok(request):
+        return _admin_denied()
+    return _json(admin_module.capability_rows(_abilities_of))
+
+
+async def admin_keys_list(request: web.Request) -> web.Response:
+    """``GET /chp/admin/keys`` — the table, plus the read-only default key."""
+    if not _admin_ok(request):
+        return _admin_denied()
+    return _json(admin_module.rows())
+
+
+async def admin_keys_create(request: web.Request) -> web.Response:
+    """``POST /chp/admin/keys`` — append one key."""
+    if not _admin_ok(request):
+        return _admin_denied()
+    try:
+        body = await request.json()
+    except Exception:
+        return _fail("bad_request")
+    try:
+        return _json(admin_module.add(body), status=201)
+    except admin_module.AdminError as refused:
+        return _admin_error(refused)
+
+
+async def admin_key_update(request: web.Request) -> web.Response:
+    """``POST /chp/admin/keys/{key_id}`` — edit one key (or regenerate its value)."""
+    if not _admin_ok(request):
+        return _admin_denied()
+    try:
+        body = await request.json()
+    except Exception:
+        return _fail("bad_request")
+    try:
+        return _json(admin_module.update(str(request.match_info.get("key_id") or ""), body))
+    except admin_module.AdminError as refused:
+        return _admin_error(refused)
+
+
+async def admin_key_delete(request: web.Request) -> web.Response:
+    """``DELETE /chp/admin/keys/{key_id}`` — remove one key.  Takes effect at once."""
+    if not _admin_ok(request):
+        return _admin_denied()
+    identifier = str(request.match_info.get("key_id") or "")
+    if not admin_module.drop(identifier):
+        return _fail("not_found", "没有这个 id 的 key。", detail={"id": identifier})
+    return _json(admin_module.rows())
+
+
+# --------------------------------------------------------------------------- #
 # wiring
 # --------------------------------------------------------------------------- #
 
@@ -1118,6 +1219,16 @@ def register_routes(routes: Any = None) -> bool:
     routes.post(f"{API_ROOT}/jobs/{{job_id}}/cancel")(cancel_job)
     routes.post(f"{API_ROOT}/translate")(translate_prompts)
     routes.post(f"{API_ROOT}/speech")(speech_endpoint)
+    # 控制台：同一个服务、同一个端口，**但不在 `endpoints` 里**（§4.9）。客户端只从
+    # 文档读地址，所以它永远不知道这一族存在；契约因此保持干净。路径常量与那份清单
+    # 都在 :mod:`hamdraw_chp.admin` 里 —— 清单是给测试比对用的，两边各写一次才对得上。
+    routes.get(admin_module.ADMIN_ROOT)(admin_page)
+    routes.get(admin_module.PAGE_PATH)(admin_page)
+    routes.get(admin_module.CAPABILITIES_PATH)(admin_capabilities)
+    routes.get(admin_module.KEYS_PATH)(admin_keys_list)
+    routes.post(admin_module.KEYS_PATH)(admin_keys_create)
+    routes.post(admin_module.KEY_PATH)(admin_key_update)
+    routes.delete(admin_module.KEY_PATH)(admin_key_delete)
     return True
 
 

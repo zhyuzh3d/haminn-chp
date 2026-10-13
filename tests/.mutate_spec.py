@@ -27,6 +27,12 @@ KEYS = "hamdraw_chp/keys.py"
 #: 而 SKIP 与 CAUGHT 在退出码上分不出来）。
 SPEECH = "hamdraw_chp/speech.py"
 
+#: 管理面（S4）。控制台有两份被判据看着的产物：**代码**与**那一页 HTML**。
+#: 页面也要能变异 —— "页面上没有改凭据的入口"这条判据，只有在"往页面里加一个入口就
+#: 会红"被证明过之后才算数。
+ADMIN = "hamdraw_chp/admin.py"
+ADMIN_PAGE = "hamdraw_chp/admin.html"
+
 #: 变异会把某一处改坏, 而"改坏"的一种样子就是让某条路径变成死等。没有上限的话
 #: 一次死等就把整个脚本拖住, 读的人分不清"它在跑"和"它卡住了"。
 RUN_TIMEOUT_SECONDS = 60
@@ -632,6 +638,164 @@ MUTATIONS = [
         '    if not keys_module.permits(record, speech_module.CATEGORY):',
         '    if False:',
         "只授权画图的钥匙念不了语音",
+    ),
+    # --- 控制台（S4，管理面） --------------------------------------------- #
+    (
+        # 写坏的凭据文件不许变成"谁都进得来"：空密码是"文件写坏了"，不是"没设密码"。
+        "凭据文件密码为空时当成放行（空密码 = 谁都进得来）",
+        ADMIN,
+        '    if not password:',
+        '    if False:',
+        "空密码是写坏了 ⇒ 回默认值",
+    ),
+    (
+        # 同一个 `except` 里住着两种坏法，所以这里要**两条**变异（一条一种签名）：
+        # 这一条把"读不出来"整条改成回空凭据 —— 它先撞在"没写文件时要用默认值"上，
+        # 也就是文件不存在那一半。
+        "凭据文件读不出来时回一个空凭据（而不是回默认值）",
+        ADMIN,
+        '    except (OSError, ValueError):\n        return record',
+        '    except (OSError, ValueError):\n        return {"user": "", "password": ""}',
+        "没写文件时要用代码里的默认值",
+    ),
+    (
+        # 另一半：文件在、但解不开。这条只坏"损坏"这一种，文件不存在照旧回默认值 ——
+        # 于是它必然打在"解不开的凭据文件回默认值"那句上，而不是被前一句盖过去。
+        "凭据文件损坏时回一个空凭据（文件不存在那一半照旧）",
+        ADMIN,
+        '    except (OSError, ValueError):\n        return record',
+        '    except ValueError:\n        return {"user": "", "password": ""}\n'
+        '    except OSError:\n        return record',
+        "解不开的凭据文件回默认值",
+    ),
+    (
+        # 控制台必须是 Basic 那条独立的线。少一次 scheme 检查，"拿一份合法载荷换个前缀"
+        # 就能用数据面的载体进门 —— 而那正是管理面与数据面共钥匙的第一步。
+        "控制台不检查 scheme（Bearer 里塞一份 Basic 载荷也能进门）",
+        ADMIN,
+        '    if value[:6].lower() != "basic ":\n        return None',
+        '    if not value:\n        return None',
+        "同一份凭据换个 scheme 也不行",
+    ),
+    (
+        # 凭据是缓存住的（业主口径：改完要重启）。去掉缓存 = 谁有文件权限，谁改完立刻生效。
+        "控制台凭据不再缓存（改文件就立刻生效，不必重启）",
+        ADMIN,
+        '    if _CREDENTIALS is None:\n        _CREDENTIALS = _read()',
+        '    _CREDENTIALS = _read()',
+        "换了文件但还没重启 ⇒ 旧凭据照用",
+    ),
+    (
+        "控制台的 401 也带上 spec（把自己的形状混进协议里）",
+        SERVER,
+        '        {"error": "unauthorized", "message": "需要控制台凭据（用户名与密码）。"},',
+        '        {"error": "unauthorized", "spec": "chp/2",\n'
+        '         "message": "需要控制台凭据（用户名与密码）。"},',
+        "控制台不是协议的一部分, 401 里不许有 spec",
+    ),
+    (
+        # 没有这个头，浏览器不会弹登录框 —— 于是页面就必须自带一个登录表单，
+        # 而"页面上没有改凭据的入口"那条判据会跟着一起垮。
+        "控制台的 401 不带 WWW-Authenticate（浏览器不再弹登录框）",
+        SERVER,
+        '        status=401, headers=admin_module.challenge(),',
+        '        status=401, headers={},',
+        "控制台的 401 要带 WWW-Authenticate",
+    ),
+    (
+        "控制台页面多调一条不属于它的路由",
+        ADMIN_PAGE,
+        "await call('GET', '/chp/admin/capabilities')",
+        "await call('GET', '/chp/capabilities')",
+        "页面只能调控制台自己那几条路由",
+    ),
+    (
+        "控制台页面上多出一个密码输入框（改凭据的入口）",
+        ADMIN_PAGE,
+        '<input type="text" id="keyvalue" placeholder="key（留空即自动生成）" size="36">',
+        '<input type="text" id="keyvalue" placeholder="key（留空即自动生成）" size="36">\n'
+        '      <input type="password" id="newpass" placeholder="新密码">',
+        "页面上不许有任何改凭据的入口",
+    ),
+    (
+        "清单外的 category 也收下（控制台可以给不存在的场景发授权）",
+        ADMIN,
+        '    refused = [item for item in unknown(cleaned) if item]\n    if refused:',
+        '    refused = [item for item in unknown(cleaned) if item]\n    if False:',
+        "清单外的 category 要拒收",
+    ),
+    (
+        # 控制台与 /chp/info 必须同源：写死 True 会让管理员以为一切都配好了。
+        "控制台把 ready 写死成 True（与 /chp/info 各说各话）",
+        ADMIN,
+        '            "ready": bool(ability.get("ready")),',
+        '            "ready": True,',
+        "控制台与 /chp/info 必须同源",
+    ),
+    (
+        # 默认钥匙是"只看不碰"的：它不在 key 表里，控制台也没有权限改它，
+        # 所以把它的值印出来只会多一处泄漏面。
+        "控制台把默认钥匙的值也印出来（只读行变成泄漏面）",
+        ADMIN,
+        '            "label": "默认钥匙（配置节点的密码 / HAMDRAW_PASSWORD）",\n            "key": "",',
+        '            "label": "默认钥匙（配置节点的密码 / HAMDRAW_PASSWORD）",\n'
+        '            "key": settings_module.password(),',
+        "默认钥匙的值不许出现在控制台里",
+    ),
+    (
+        "控制台改完 key 不落盘（只回执，不生效）",
+        ADMIN,
+        '        entries[index] = merged\n        store(entries)\n        return merged',
+        '        entries[index] = merged\n        return merged',
+        "撤掉 speak 之后立刻就不能念了",
+    ),
+    (
+        "「换一把」不真的换（旧钥匙继续有效）",
+        ADMIN,
+        '        if fields.get("regenerate"):',
+        '        if False:',
+        "要求换一把就得换一把",
+    ),
+    (
+        # 删不存在的 id 也报成功 ⇒ 控制台会告诉管理员"删掉了"，而表里那行还在。
+        "删不存在的 id 也报成功（静默的假回执）",
+        ADMIN,
+        '    if len(kept) == len(entries):\n        return False',
+        '    if False:\n        return False',
+        "再删一次要 404",
+    ),
+    (
+        # 数据面也认 Basic（取 `:` 之后那段当 key）⇒ 同值就意味着控制台密码顺带
+        # 成了一把数据面钥匙。这条规矩是"三把钥匙分三条线"里最容易被忘掉的一环。
+        "表里可以登记与控制台凭据同值的 key",
+        ADMIN,
+        '    if keys_module.matches(offered, credential["password"]) \\\n'
+        '            or keys_module.matches(offered, credential["user"]):',
+        '    if False:',
+        "与控制台凭据同值的 key 要拒收",
+    ),
+    (
+        "key 表写出来是世界可读的（0644）",
+        ADMIN,
+        '    os.chmod(temporary, 0o600)',
+        '    os.chmod(temporary, 0o644)',
+        "权限要是 0600",
+    ),
+    (
+        "就地覆盖 key 表（原子写退化，临时文件留在盘上）",
+        ADMIN,
+        '    os.chmod(temporary, 0o600)\n    os.replace(temporary, destination)',
+        '    os.chmod(temporary, 0o600)\n'
+        '    destination.write_text(temporary.read_text(encoding="utf-8"), encoding="utf-8")',
+        "写完不许留下 .tmp",
+    ),
+    (
+        # 授权域名少一个「语音」⇒ 控制台根本授不出 speak（那它就没法管朗读这件事）。
+        "控制台的授权域里没有 speak（语音授不出来）",
+        ADMIN,
+        '    return [*capabilities_module.categories(), speech_module.CATEGORY]',
+        '    return list(capabilities_module.categories())',
+        "图片侧五个 + speak",
     ),
 ]
 

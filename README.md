@@ -171,6 +171,8 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 **`progress` 允许为 `null`，而且经常就是 `null`。** 编一个假百分比比给 `null` 更糟；`queue_position`（前面还有几个作业，自己在跑时为 0）是任何实现都算得出来的可靠数字，客户端用不确定态 + 队列位置就够了。
 
+**这张表就是全部端点。** 管理面（控制台）**故意不在里面** —— 见下面「控制台」一节：客户端只从文档读地址，所以不在文档里的东西对它不存在。
+
 ### 钥匙放在哪：一个请求只用一种载体
 
 | 请求 | 载体 |
@@ -375,6 +377,40 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 **ComfyUI 重启会带走语音** —— 多了一个耦合，与 `translate` 今天的处境完全一样；`timeout` 兜底。
 
+## 控制台（管理面）
+
+同一个服务、同一个端口上的一个网页：**管 key 与 key 的授权**。地址是 `/chp/admin/`。
+
+**它不在 `endpoints` 里**（§0-3 那条"地址一律从文档里读"的反面用法）：客户端只从信息文档取地址，所以它**永远不知道控制台存在**，契约保持干净 —— 控制台不是协议的一部分。
+
+打开它，浏览器会自己弹一个登录框（那个 401 带 `WWW-Authenticate`，所以**页面上没有、也不需要任何登录表单**）：
+
+| | |
+|---|---|
+| 用户名 / 密码 | `chp_admin.json` 里的 `user` / `password`；**文件不存在时用代码里的默认值 `hamster` / `imahamster`** |
+| 改它 | 只能在**本机**改那个文件（SSH / 编辑器），**改完要重启**才生效 |
+| 能做什么 | 看**已注册的能力**（只读）、建 key、改 key 的标签与授权、换一把、删掉 |
+| 不能做什么 | **不能新增能力、不能改模型配置、不能改凭据** —— 页面上没有那样的入口 |
+
+**为什么"不能改凭据"不是靠自觉**：三条线用了三个文件，控制台**根本没有那把钥匙**：
+
+| 钥匙 | 谁对谁 | 存哪 |
+|---|---|---|
+| **数据面 key** | 客户端 ↔ CHP | `chp_keys.json`（+ 配置节点里的密码 / `HAMDRAW_PASSWORD` 作为**默认钥匙**，权限全部） |
+| **控制台凭据** | 管理员 ↔ 控制台 | `chp_admin.json`（**只能本机改，改完重启**） |
+| **引擎令牌** | CHP ↔ 语音引擎 | `hamdraw_settings.json` 的 `speech.token`（**永不进文档、永不进响应**） |
+
+这三把**不许共用同一个值**：数据面 key 泄漏 = 白用模型；它若能进控制台，就是"能改授权、能给自己造 key" = 接管。实现上有一道闸专门管这件事的两半：
+
+- 控制台**只认 `Basic`**（`Bearer` 进不来）—— 数据面那把钥匙不能当控制台凭据使；
+- 往表里写一把**与控制台凭据同值**的 key 会被**拒收** —— 因为数据面也认 `Basic`（把 `:` 之后那段当 key），同值就等于控制台密码顺带成了一把数据面钥匙。
+
+**授权只能从已注册的清单里选。** 那份清单**就是代码里的 `category` 表**（`fast` / `inpaint` / `upscale` / `render` / `generate`，外加语音的 `speak`），页面上列的就是它、`GET /chp/admin/capabilities` 回的也是它，**每个场景的 `ready` / `missing` 与 `/chp/info` 同源**（两边说法不一致会让管理员去找一个并不存在的配置问题）。提交一个清单外的 `category` 一律拒收 —— 与数据面的 `unsupported_category` 同一条纪律。**"添加一个模型"这个动作在控制台里不存在**：能力是代码，授权是数据；前者改代码、重启，后者点控制台、**下一个请求就生效**。
+
+`categories` 写 `["*"]` 是"全部"，写空数组是"什么都看不见、也什么都做不了"（撤权但先不删的写法）。**key 明文存储**、表按 `0600` 原子写：它就是一把可以抄出来交给别人的钥匙，而管理员需要能把它复制走。
+
+三个配置文件都**不在版本库里**（`.gitignore`），也都**不会进发布 zip**（`tools/package-plugin.py` 按名字排除，且发现它们在树里会打一行警告）：发布包该装到谁的机器上，谁的机器上就还没有这些凭据。
+
 ## 自测
 
 ```bash
@@ -409,6 +445,10 @@ curl -s -D- -X POST http://<host>:8188/chp/speech -H 'Content-Type: application/
 curl -s -D- -X POST http://<host>:8188/chp/speech -H 'Content-Type: application/json' \
   -d '{"text":"你好，这是一次测试。","voice":"vivian","stream":false,
        "chp_params":{"password":"<password>"}}' -o speech.wav
+
+# 6. 控制台（管理面）：默认凭据是 hamster / imahamster，没写 chp_admin.json 时就用它
+curl -s -u hamster:imahamster http://<host>:8188/chp/admin/capabilities
+curl -s -u hamster:imahamster http://<host>:8188/chp/admin/keys
 ```
 
 用 `python3 -m json.tool` 过一遍第 1 步的返回，重点确认六件事：`spec` 是 `chp/2`、`rules` 有你预期的五条、`abilities` 的 `ready` 为 `true`、每个 `category` 至少命中一帧、`input_schemas` 恰好三份（三条规则各一份）、`speech` 段里有 `txt-2-sph` 那条规则与那份音色菜单（引擎没配时它是 `ready: false`，不是缺失）。

@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CHP 控制台</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: #f5f6f8; color: #1b1d21;
+         font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  h2 { margin: 28px 0 8px; font-size: 16px; }
+  p.lead { margin: 0 0 4px; color: #5b6068; }
+  .note { margin: 8px 0 0; padding: 10px 12px; border-left: 3px solid #9aa3af;
+          background: #eceef1; color: #4a4f57; border-radius: 0 4px 4px 0; }
+  table { width: 100%; border-collapse: collapse; background: #fff;
+          border: 1px solid #dfe2e6; border-radius: 6px; overflow: hidden; }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #eceef1;
+           vertical-align: top; }
+  th { background: #fafbfc; font-weight: 600; color: #4a4f57; }
+  tr:last-child td { border-bottom: 0; }
+  code, .key { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .key { word-break: break-all; }
+  .muted { color: #7b8189; }
+  .tag { display: inline-block; padding: 1px 6px; margin: 0 4px 2px 0; border-radius: 3px;
+         background: #eef1f5; color: #3d4249; font-size: 12px; }
+  .ok { color: #1f7a3d; }
+  .bad { color: #b3261e; }
+  button { font: inherit; padding: 5px 12px; border: 1px solid #c6cad0; border-radius: 5px;
+           background: #fff; cursor: pointer; }
+  button:hover { background: #f0f2f5; }
+  button.primary { border-color: #1a5fb4; background: #1a5fb4; color: #fff; }
+  button.primary:hover { background: #17539e; }
+  button.danger { border-color: #d9a19c; color: #b3261e; }
+  input[type=text] { font: inherit; padding: 5px 8px; border: 1px solid #c6cad0; border-radius: 5px; }
+  fieldset { margin: 0; padding: 0; border: 0; }
+  label.chk { display: inline-flex; align-items: center; gap: 5px; margin: 0 14px 6px 0; }
+  form { margin-top: 10px; padding: 14px; background: #fff; border: 1px solid #dfe2e6;
+         border-radius: 6px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  #toast { position: fixed; right: 18px; bottom: 18px; max-width: 420px; padding: 10px 14px;
+           border-radius: 6px; background: #1b1d21; color: #fff; opacity: 0;
+           transition: opacity .2s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<main>
+  <h1>CHP 控制台</h1>
+  <p class="lead">管 key 与 key 的授权。能力的<b>存在与形状</b>由代码决定，这里只能<b>开关与授权</b>。</p>
+
+  <p class="note">
+    本页与代理由浏览器自己的登录框鉴权（凭据只能在本机的插件目录里编辑，改完要重启）。
+    控制台<b>不能新增能力、不能改模型配置、也不能改凭据</b> —— 页面上没有那样的入口。
+  </p>
+
+  <h2>已注册的能力（只读）</h2>
+  <table>
+    <thead><tr><th>category</th><th>规则</th><th>名称</th><th>就绪</th></tr></thead>
+    <tbody id="caps"><tr><td colspan="4" class="muted">读取中…</td></tr></tbody>
+  </table>
+
+  <h2>key 表</h2>
+  <table>
+    <thead><tr><th>标签</th><th>key</th><th>授权</th><th>建立时间</th><th>操作</th></tr></thead>
+    <tbody id="keys"><tr><td colspan="5" class="muted">读取中…</td></tr></tbody>
+  </table>
+
+  <h2>新建一把 key</h2>
+  <form id="create" onsubmit="return createKey(event)">
+    <div class="row">
+      <input type="text" id="label" placeholder="标签，例如「A1X 上的 Chataxi」" size="36">
+      <input type="text" id="keyvalue" placeholder="key（留空即自动生成）" size="36">
+    </div>
+    <fieldset id="grant"></fieldset>
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="all" onchange="toggleAll()"> 全部（<code>*</code>）</label>
+    </div>
+    <button class="primary" type="submit">新建</button>
+    <span class="muted">　授权为空 = 这把 key 什么都看不见、也什么都做不了（撤权但先不删的写法）。</span>
+  </form>
+</main>
+<div id="toast"></div>
+
+<script>
+let CAPS = [];
+let KEYS = [];
+
+function toast(message, bad) {
+  const box = document.getElementById('toast');
+  box.textContent = message;
+  box.style.background = bad ? '#b3261e' : '#1b1d21';
+  box.classList.add('show');
+  clearTimeout(box._timer);
+  box._timer = setTimeout(() => box.classList.remove('show'), bad ? 6000 : 2500);
+}
+
+async function call(method, path, body) {
+  const answer = await fetch(path, {
+    method,
+    credentials: 'same-origin',
+    headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (answer.status === 401) {
+    // 浏览器应当在第一次 401 时就弹过登录框；走到这里说明它没带凭据。
+    toast('需要控制台凭据：刷新一次页面，在浏览器的登录框里填用户名与密码。', true);
+    throw new Error('unauthorized');
+  }
+  const text = await answer.text();
+  const payload = text ? JSON.parse(text) : {};
+  if (!answer.ok) {
+    toast((payload && payload.message) || ('HTTP ' + answer.status), true);
+    throw new Error((payload && payload.code) || 'failed');
+  }
+  return payload;
+}
+
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g,
+    ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+function renderCaps() {
+  document.getElementById('caps').innerHTML = CAPS.map(row => `
+    <tr>
+      <td><code>${esc(row.category)}</code></td>
+      <td class="muted">${esc(row.rule)}</td>
+      <td>${esc(row.label.zh)}<span class="muted"> / ${esc(row.label.en)}</span></td>
+      <td>${row.ready ? '<span class="ok">好了</span>'
+                      : '<span class="bad">缺 ' + esc(row.missing.join('、')) + '</span>'}</td>
+    </tr>`).join('');
+  document.getElementById('grant').innerHTML = CAPS.map(row =>
+    `<label class="chk"><input type="checkbox" class="grant" value="${esc(row.category)}"> <code>${esc(row.category)}</code></label>`
+  ).join('');
+}
+
+function renderKeys() {
+  document.getElementById('keys').innerHTML = KEYS.map(row => {
+    const grants = row.categories.length
+      ? row.categories.map(name => `<span class="tag">${esc(name)}</span>`).join('')
+      : '<span class="muted">（空：什么都做不了）</span>';
+    // 按钮只用 data-* 带 id，**不把 id 写进 onclick 的 JS 字符串里**：这份表是可以在
+    // 本机手改的，一个带引号的 id 会从 JS 字符串里跳出来。事件的绑定点在下面的委派里。
+    const actions = row.source === 'default'
+      ? '<span class="muted">只读</span>'
+      : `<button data-act="rename" data-id="${esc(row.id)}">改标签</button>
+         <button data-act="regrant" data-id="${esc(row.id)}">改授权</button>
+         <button data-act="regen" data-id="${esc(row.id)}">换一把</button>
+         <button class="danger" data-act="remove" data-id="${esc(row.id)}">删除</button>`;
+    return `<tr>
+      <td>${esc(row.label) || '<span class="muted">（无标签）</span>'}</td>
+      <td class="key">${row.key ? esc(row.key) : '<span class="muted">不在此显示</span>'}</td>
+      <td>${grants}</td>
+      <td class="muted">${esc(row.created) || '—'}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join('');
+}
+
+function chosen() {
+  return Array.from(document.querySelectorAll('.grant:checked')).map(box => box.value);
+}
+
+function toggleAll() {
+  const all = document.getElementById('all').checked;
+  document.querySelectorAll('.grant').forEach(box => { box.checked = false; box.disabled = all; });
+}
+
+async function reload() {
+  CAPS = await call('GET', '/chp/admin/capabilities');
+  renderCaps();
+  KEYS = await call('GET', '/chp/admin/keys');
+  renderKeys();
+}
+
+async function createKey(event) {
+  event.preventDefault();
+  const body = { label: document.getElementById('label').value,
+                 key: document.getElementById('keyvalue').value };
+  body.categories = document.getElementById('all').checked ? ['*'] : chosen();
+  const made = await call('POST', '/chp/admin/keys', body);
+  document.getElementById('label').value = '';
+  document.getElementById('keyvalue').value = '';
+  document.getElementById('all').checked = false;
+  toggleAll();
+  toast('已新建：' + made.key + '（现在复制走，稍后也能在表里看到）');
+  await reload();
+  return false;
+}
+
+async function rename(id) {
+  const row = KEYS.find(item => item.id === id);
+  const label = prompt('新的标签', row ? row.label : '');
+  if (label === null) return;
+  await call('POST', '/chp/admin/keys/' + encodeURIComponent(id), { label });
+  await reload();
+}
+
+async function regrant(id) {
+  const row = KEYS.find(item => item.id === id);
+  const current = row ? row.categories.join(',') : '';
+  const answer = prompt('新的授权，逗号分隔（' + CAPS.map(c => c.category).join(' / ') + '；写 * 表示全部）', current);
+  if (answer === null) return;
+  const categories = answer.split(',').map(part => part.trim()).filter(Boolean);
+  await call('POST', '/chp/admin/keys/' + encodeURIComponent(id), { categories });
+  await reload();
+}
+
+async function regen(id) {
+  if (!confirm('换一把新 key？旧的那把立刻失效。')) return;
+  await call('POST', '/chp/admin/keys/' + encodeURIComponent(id), { regenerate: true });
+  await reload();
+}
+
+async function removeKey(id) {
+  const row = KEYS.find(item => item.id === id);
+  if (!confirm('删除 ' + ((row && row.label) || id) + '？这把 key 立刻失效。')) return;
+  await call('DELETE', '/chp/admin/keys/' + encodeURIComponent(id));
+  await reload();
+}
+
+// 一个委派的点击处理点：表是重画的，而处理函数只认 data-act，不认任何拼进
+// HTML 的代码。
+document.getElementById('keys').addEventListener('click', event => {
+  const button = event.target.closest('button[data-act]');
+  if (!button) return;
+  const acts = { rename, regrant, regen, remove: removeKey };
+  const run = acts[button.dataset.act];
+  if (run) run(button.dataset.id);
+});
+
+reload().catch(() => {});
+</script>
+</body>
+</html>
