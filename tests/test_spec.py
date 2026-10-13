@@ -108,10 +108,14 @@ _stub("execution", validate_prompt=_validate_prompt)
 # install — and lets the memory test pretend the process restarted.
 _SCRATCH = Path(tempfile.mkdtemp(prefix="chp-test-"))
 os.environ["HAMDRAW_SETTINGS"] = str(_SCRATCH / "hamdraw_settings.json")
+#: The key table gets its own scratch path for the same reason — and one more:
+#: without it, running this file on a machine that really has a ``chp_keys.json``
+#: next to the package would silently change what "no keys configured" means.
+os.environ["HAMDRAW_KEYS"] = str(_SCRATCH / "chp_keys.json")
 for _name in ("HAMDRAW_PASSWORD", "HAMDRAW_TRANSLATE_URL", "HAMDRAW_TRANSLATE_MODEL"):
     os.environ.pop(_name, None)
 
-from hamdraw_chp import backends, capabilities, families, server, settings, translate, version  # noqa: E402
+from hamdraw_chp import backends, capabilities, families, keys, server, settings, translate, version  # noqa: E402
 
 
 def check(condition: bool, message: str) -> None:
@@ -119,9 +123,45 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def gateway(label: str, call: Any) -> Any:
+    """Run one probe, turning *any* exception it raises into a **named** failure.
+
+    The non-ASCII probes below exist because ``hmac.compare_digest`` raises on a
+    ``str`` holding a non-ASCII character.  Without this wrapper that surfaces as a
+    bare ``TypeError`` traceback: the test would be red, but the mutation script —
+    which matches on the **name** of the assertion that caught it — would report
+    ESCAPED, and a red test nobody can name is how a real defect gets waved through.
+    """
+    try:
+        return call()
+    except Exception as exc:  # noqa: BLE001
+        raise AssertionError(f"{label}（{type(exc).__name__}: {exc}）") from None
+
+
 def forget_settings() -> None:
     """Drop the scratch settings file so the next test starts from the defaults."""
     settings.path().unlink(missing_ok=True)
+
+
+def key_entry(key: str, categories: list[str]) -> dict[str, Any]:
+    """One ``chp_keys.json`` entry, in the shape the console writes."""
+    return {"id": "k_" + key, "label": "测试 " + key, "key": key, "categories": list(categories),
+            "created": "2026-10-13T00:00:00+08:00"}
+
+
+def write_keys(*entries: dict[str, Any]) -> None:
+    keys.path().write_text(json.dumps({"schema": keys.SCHEMA, "keys": list(entries)},
+                                      ensure_ascii=False), encoding="utf-8")
+
+
+def forget_keys() -> None:
+    """Back to "this deployment has no key table at all"."""
+    keys.path().unlink(missing_ok=True)
+
+
+def info_with(headers: dict[str, str] | None = None) -> FakeResponse:
+    """``GET /chp/info`` — the one call a client makes before it knows anything."""
+    return asyncio.run(server.info(FakeRequest(None, headers)))
 
 
 #: The name the three checkpoint categories share, which is why they are *one*
@@ -296,13 +336,19 @@ def check_information_document() -> None:
 
 
 def check_document_auth_reports_both_states() -> bool:
-    """一个接口同时回答"地址对不对"和"密码对不对" —— 错密码不是错误。"""
-    wrong = document_of(authorized=False, auth_required=True)
-    open_ = document_of(authorized=True, auth_required=False)
-    check(wrong["auth"]["authorized"] is False and wrong["auth"]["required"] is True,
-          "密码错: authorized=false 但仍然给全文档")
-    check(open_["auth"]["required"] is False, "没设密码时 required=false")
-    check(len(wrong["rules"]) == len(open_["rules"]) == 5, "密码错也要播报完整契约")
+    """``auth`` 段仍然如实反映传进去的两个布尔量。
+
+    **这一段的前提在 2026-10-13 变了**：``authorized=false`` 不再是一种在生产里
+    出现得了的状态 —— 钥匙不对时服务端先回 401，根本走不到生成文档这一步。它现在
+    只守一件事：那块字段还在、还如实（删字段是破坏，而客户端会读它）。
+    「两态」真正的内容在 :func:`check_key_authorization`（公开态 / 配了 key 两态）。
+    """
+    unset = document_of(auth_required=False)
+    configured = document_of(authorized=True, auth_required=True)
+    check(configured["auth"]["authorized"] is True and configured["auth"]["required"] is True,
+          "配了钥匙、钥匙又对: 两个都是 true")
+    check(unset["auth"]["required"] is False, "没配钥匙时 required=false")
+    check(unset["auth"]["authorized"] is True, "公开态也是「进来了」—— 门本来就没关")
     return True
 
 
@@ -1402,6 +1448,160 @@ def check_request_idempotency() -> None:
     forget_settings()
 
 
+def check_key_authorization() -> None:
+    """key 的两态与两层 —— 计划 §3.2.1（边界）与 §3.3（播报 + 执行）。
+
+    这里的断言必须成对地读：**「一把都没配 ⇒ 公开」与「配了 ⇒ 401」方向相反，
+    而把它们混成一条是这段设计最容易出的一种错**（要么把老用户的空密码部署判死，
+    要么让配好的 key 形同不存在）。变异脚本也正是按这一对写的。
+    """
+    every = len(capabilities.CATEGORY_TABLE)
+    try:
+        # ① 一把 key 都没配 ⇒ 公开态。这是**今天的既有行为**，不许被无声取消：
+        #    用户的工作流与卡片里存的可能就是空密码。
+        forget_settings()
+        forget_keys()
+        # 模型要重新配回来：上面那一句连同 password（空）把整份设置清了，
+        # 而"没有模型"会以 no_model 拒收 —— 那是另一条判据，别混进来。
+        use_render()
+        opened = info_with()
+        check(opened.status == 200,
+              f"一把 key 都没配时 /chp/info 要 200, 得到 {opened.status} {opened.payload}")
+        check(opened.payload["auth"]["required"] is False, "没配任何 key ⇒ auth.required=false")
+        check(len(opened.payload["rules"]) == every, f"公开态要播报全部 {every} 个类别")
+        check(len(opened.payload["input_schemas"]) == len(capabilities.INPUT_SCHEMAS),
+              "公开态要播报全部输入 schema")
+        check(submit(body_for("render")).status == 202, "公开态不校验: 提交照过")
+
+        # ② 配了至少一把 key 之后 ⇒ 无 key / 错 key 都是 401，而且响应体带 spec。
+        write_keys(key_entry("k-fast", ["fast"]))
+        refused = info_with()
+        check(refused.status == 401 and refused.payload["error"] == "unauthorized",
+              f"配了 key 之后无 key 要 401, 得到 {refused.status} {refused.payload}")
+        check(refused.payload.get("spec") == capabilities.SPEC,
+              f"401 要带 spec 自证是 CHP（客户端据此不必猜 URL）, 得到 {refused.payload}")
+        check(info_with({"Authorization": "Bearer nope"}).status == 401, "错 key 也是 401")
+        # 只有 401 带 spec：其余错误码的响应形状一个字节都没变 —— 客户端按形状解析。
+        shape = submit(body_for("render", chp_params={"password": "nope"}))
+        check(shape.status == 401 and shape.payload.get("spec") == capabilities.SPEC,
+              "字段里带的错 key 同样是带 spec 的 401")
+        bad = submit({"category": "nope"}, headers={"Authorization": "Bearer k-fast"})
+        check(bad.status == 400 and "spec" not in bad.payload,
+              f"别的错误码不许带 spec（响应形状是冻结的）, 得到 {bad.payload}")
+
+        # ③ 播报层：只授权 fast ⇒ rules 与 abilities **同时**少。
+        #    只少一边会在界面上留下一个点不动的槽 —— 客户端是按 signature 配槽的。
+        limited = info_with({"Authorization": "Bearer k-fast"})
+        check(limited.status == 200, f"带对的 key 要 200, 得到 {limited.payload}")
+        check([entry["category"] for entry in limited.payload["rules"]] == ["fast"],
+              f"只授权 fast ⇒ rules 只剩它, 得到 {[e['category'] for e in limited.payload['rules']]}")
+        frames = [frame for ability in limited.payload["abilities"] for frame in ability["frames"]]
+        check({frame["category"] for frame in frames} == {"fast"},
+              f"abilities 必须与 rules 同步少, 得到 {sorted({f['category'] for f in frames})}")
+        check(set(limited.payload["input_schemas"]) == {"txt-ref-2-img/v1"},
+              f"schema 按仍在用的规则过滤, 得到 {sorted(limited.payload['input_schemas'])}")
+        check(limited.payload["auth"]["required"] is True
+              and limited.payload["auth"]["authorized"] is True,
+              "配了 key ⇒ required=true，而这一把是对的")
+
+        # ④ 执行层（承重）：用这把 key 打 generate ⇒ 403。
+        #    「看不到」是障眼法 —— 知道 category 名字的人直接 POST 就绕过了界面。
+        refused_category = submit(body_for("generate"), headers={"Authorization": "Bearer k-fast"})
+        check(refused_category.status == 403
+              and refused_category.payload["error"] == "forbidden_capability",
+              f"未授权的 category 要 403, 得到 {refused_category.status} {refused_category.payload}")
+        check(refused_category.payload["detail"]["category"] == "generate",
+              "403 要点名是哪个 category")
+        # 而它授权的那一个照常受理 —— 少了这条，一个"全都拒了"的实现也能全绿。
+        check(submit(body_for("fast", resolution="512x512"),
+                     headers={"Authorization": "Bearer k-fast"}).status == 202,
+              "授权内的 category 必须照常受理")
+
+        # ⑤ 默认 key（配置节点的密码 / HAMDRAW_PASSWORD）⇔ 全能力，且它与公开态等价。
+        settings.update(password="pw-under-test")
+        default = info_with({"Authorization": "Bearer pw-under-test"})
+        check(default.status == 200,
+              f"默认 key 要能过门, 得到 {default.status} {default.payload}")
+        check(len(default.payload["rules"]) == every, "默认 key 要看得到全部类别")
+        check(default.payload["rules"] == opened.payload["rules"],
+              "默认 key 的文档要与公开态逐项相同（权限一样，只是多了道门）")
+        check(default.payload["input_schemas"] == opened.payload["input_schemas"],
+              "schema 也一样")
+        check(submit(body_for("render"), headers={"Authorization": "Bearer pw-under-test"}).status == 202,
+              "默认 key 要能打每一个类别，包括 key 表里那把打不了的 generate")
+        check(submit(body_for("render", chp_params={"password": "pw-under-test"})).status == 202,
+              "默认 key 从字段里来也算数（老卡片就是这么写的）")
+
+        # 空授权集 = 一把什么都看不见、也什么都做不了的 key。
+        # 这是一条**正经答案**而不是错误：撤权而不删 key，靠的就是它。
+        write_keys(key_entry("k-none", []))
+        nothing = info_with({"Authorization": "Bearer k-none"})
+        check(nothing.status == 200 and nothing.payload["rules"] == []
+              and nothing.payload["abilities"] == [],
+              f"空授权集不等于「全部」, 得到 {nothing.payload['rules']}")
+        check(submit(body_for("render"), headers={"Authorization": "Bearer k-none"}).status == 403,
+              "空授权集打任何 category 都是 403")
+
+        # 读坏了的 key 表 = 没有 key 表，但**不许把服务打死**，也不许变成"谁都放行"。
+        keys.path().write_text("{ not json", encoding="utf-8")
+        check(keys.read() == [], "读坏了的表当空表")
+        check(info_with({"Authorization": "Bearer k-none"}).status == 401,
+              "密码在 ⇒ 读坏了的表不许变成谁都放行")
+
+        # ⑥ 非 ASCII 的取值是**合法取值**：密码里有个「中」字，对运维再普通不过。
+        #    hmac.compare_digest 对任何含非 ASCII 的 str 直接抛 TypeError（实测），
+        #    在真机上就是"整个接口 500"——而这不是拒收，是插件自己坏了。
+        #    **两处比对共用 keys.matches，所以两条路的先后顺序是有讲究的**：先把默认
+        #    密码清掉再测 key 表，命中的才是 resolve 那一处；反过来先测默认密码，
+        #    两处变异会一起撞在同一个断言上，另一条断言就没人证伪了。
+        settings.update(password="")
+        write_keys(key_entry("中文钥匙", ["fast"]))
+        chinese_key = gateway("key 表里那把中文 key 要能进门",
+                              lambda: info_with({"Authorization": "Bearer 中文钥匙"}))
+        check(chinese_key.status == 200,
+              f"中文 key 要 200, 得到 {chinese_key.status} {chinese_key.payload}")
+        check([entry["category"] for entry in chinese_key.payload["rules"]] == ["fast"],
+              "中文 key 的授权集照样生效（不是「过门就全给」）")
+        check(gateway("对不上的中文 key 是一次干净的 401",
+                      lambda: info_with({"Authorization": "Bearer 中文铅笔"})).status == 401,
+              "对不上的中文 key 要 401, 不是异常也不是放行")
+
+        forget_keys()
+        settings.update(password="中文密码")
+        chinese_default = gateway("中文默认密码也要能进门",
+                                  lambda: info_with({"Authorization": "Bearer 中文密码"}))
+        check(chinese_default.status == 200,
+              f"中文默认密码要 200, 得到 {chinese_default.status} {chinese_default.payload}")
+        check(len(chinese_default.payload["rules"]) == every, "中文默认密码照样是全部能力")
+        check(gateway("中文默认密码从字段里来也要算数",
+                      lambda: submit(body_for("render", chp_params={"password": "中文密码"}))).status == 202,
+              "老卡片把密码写在 chp_params 里 —— 中文的也要算数")
+    finally:
+        forget_keys()
+        forget_settings()
+
+
+def check_document_filtering_is_one_pass() -> None:
+    """过滤是"同一个遍历加一个成员判断", 不是第二套表。
+
+    ``allowed=None`` 必须与过滤出现之前逐字节相同 —— 那是"老部署零改动"在**表**这一层
+    的证据（``/chp/info`` 那一层由 ``check_key_authorization`` 的 ① ⑤ 两条守着）。
+    """
+    full = capabilities.rules()
+    check(capabilities.rules(None) == full, "rules(None) 就是全部")
+    check([entry["category"] for entry in capabilities.rules({"fast"})] == ["fast"],
+          "rules(allowed) 按类别过滤，顺序仍取表序")
+    check(capabilities.input_schemas(None) == capabilities.INPUT_SCHEMAS, "不传就全给")
+    check(capabilities.input_schemas({"inpaint"}) == {"txt-msk-ref-2-img/v1": capabilities.INPUT_SCHEMAS["txt-msk-ref-2-img/v1"]},
+          "只留仍在用的那份 schema")
+    # abilities 的过滤要发生在**分组之前**: 分完组再丢类别，会把一个已经被丢掉的类别
+    # 的画幅留在那条能力的 frames 里，而那正是"界面上多出一个点不动的选项"的来源。
+    mixed = capabilities.abilities(fake_files, {"fast"})
+    all_frames = [frame for ability in mixed for frame in ability["frames"]]
+    check(all_frames and {f["category"] for f in all_frames} == {"fast"},
+          f"分组前过滤, 得到 {sorted({f['category'] for f in all_frames})}")
+
+
 def check_output_urls() -> None:
     """输出地址就是文档里公布的那条模板 —— 客户端不必自己拼。"""
     entry = {"outputs": {"9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"},
@@ -1494,9 +1694,13 @@ def check_routes() -> None:
     check(not any(path.startswith("/cvp") or path.startswith("/hamdraw") for path in every),
           f"/cvp 与 /hamdraw 下面什么都不许服务: {sorted(every)}")
 
-    # /chp/info 是公开的: 没有密码也要答
-    response = asyncio.run(server.info(FakeRequest(None)))
-    check(response.status == 200 and response.payload["spec"] == "chp/2", "信息接口要公开可答")
+    # 公开态下 /chp/info 要答 —— 一把 key 都没配时门本来就没关（§3.2.1）。
+    # 「配了 key 就 401」那一半在 check_key_authorization 里，两条一起才完整。
+    forget_keys()
+    forget_settings()
+    response = info_with()
+    check(response.status == 200 and response.payload["spec"] == "chp/2",
+          "没配任何钥匙时信息接口要能答")
     check(response.payload["auth"]["required"] is False, "没设密码时 required=false")
     check(set(response.payload["endpoints"]) == set(capabilities.ENDPOINTS), "接口要播报地址")
 
@@ -1513,6 +1717,12 @@ def main() -> None:
     check_abilities_grouping()
     check_translation_memory()
     check_settings()
+    # 授权是**进门的第一步**：后面每一条用例都建立在"门开着"这个前提上，所以它先跑。
+    # 顺序还有第二个理由 —— 变异脚本按"谁先报"认领断言的归属，而后面那批用例都从
+    # job_of() 里报同一句泛泛的"应当被受理"。把授权判在前面，公开态或默认 key 坏了
+    # 才会报在这一组**点名**的断言上，而不是被一句 helper 的通用文案盖过去。
+    check_key_authorization()
+    check_document_filtering_is_one_pass()
     check_request_channels()
     check_request_ext_defaults()
     check_request_accelerator()

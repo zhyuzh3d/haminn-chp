@@ -2,23 +2,29 @@
 
 Three kinds of endpoint, and nothing else:
 
-    GET  /chp/info                        what this server can do        (public)
-    POST /chp/jobs                        submit one job                 (Bearer)
-    GET  /chp/jobs/{id}                   state, prompt, outputs         (Bearer)
-    GET  /chp/jobs/{id}/progress          state only — the polling call  (Bearer)
-    GET  /chp/jobs/{id}/output/{index}    fetch a finished image         (Bearer)
-    POST /chp/jobs/{id}/cancel            drop a queued job              (Bearer)
-    POST /chp/translate                   pre-translate a prompt         (Bearer)
+    GET  /chp/info                        what this server can do        (key)
+    POST /chp/jobs                        submit one job                 (key)
+    GET  /chp/jobs/{id}                   state, prompt, outputs         (key)
+    GET  /chp/jobs/{id}/progress          state only — the polling call  (key)
+    GET  /chp/jobs/{id}/output/{index}    fetch a finished image         (key)
+    POST /chp/jobs/{id}/cancel            drop a queued job              (key)
+    POST /chp/translate                   pre-translate a prompt         (key)
 
-``/chp/info`` is the one a client calls first, and it answers with the whole
-contract — the rules (what shape of input each category takes), the abilities
-(which model files can serve them, and which canvases they can make), and
-whether the password that arrived was the right one.  It answers even when the
-password is wrong on purpose: knowing *what* a server can do should not require
-having already configured it, and one call then tells a client both "the address
-is right" and "the password is not".  The contract itself is defined in
-``plans/chp-spec.md``; the table it is built from lives in
-:mod:`hamdraw_chp.capabilities`.
+``/chp/info`` is the one a client calls first, and it answers with the contract
+**as far as this key is allowed to see it**: the rules (what shape of input each
+category takes), the abilities (which model files can serve them, and which
+canvases they can make), whether speech is available, and the key's own category
+set applied to all of them at once.
+
+It **needs a key** — but only once one is configured.  A deployment with no
+password and an empty key table answers ``200`` with everything, exactly as
+before, so nobody's existing card or workflow breaks; from the first configured
+key onward a missing or wrong key is ``401``.  Both states are decided in one
+function (:func:`_keys_configured`) rather than at each call site, because the
+two of them failing to agree is the failure this design is most exposed to.
+
+The contract itself is defined in ``plans/chp-spec.md``; the table it is built
+from lives in :mod:`hamdraw_chp.capabilities`.
 
 The paths never carry a version.  The protocol version travels in the document
 as ``spec``, so a client never has to guess a newer path, and a server may add
@@ -48,14 +54,32 @@ handlers to its own aiohttp app.
 
 Authentication
 --------------
-The password set in the ``HamDrawConfig`` node (or the ``HAMDRAW_PASSWORD``
-environment variable) protects every job endpoint.  A request that carries a
-body sends it in ``chp_params.password``; a ``GET``, and a ``POST`` with no body,
-send it as ``Authorization: Bearer <password>`` instead — a password has no
-business in a URL or a log line.  The header is still accepted everywhere, and
-so are ``Basic`` and ``X-HamDraw-Password``.  A wrong password answers ``401
-unauthorized`` and nothing is queued.  Leaving it empty disables the check and
-``/chp/info`` says so through ``auth.required``.
+A **key** protects every endpoint, ``/chp/info`` included.  A request that
+carries a body sends it in ``chp_params.password``; a ``GET``, and a ``POST``
+with no body, send it as ``Authorization: Bearer <key>`` instead — a secret has
+no business in a URL or a log line.  The header is still accepted everywhere, and
+so are ``Basic`` and ``X-HamDraw-Password``.  A missing or wrong key answers
+``401 unauthorized`` and nothing is queued; that response alone carries
+``spec``, so a client can tell "this is CHP, the key is wrong" from "there is no
+plugin here" without guessing at URLs.
+
+There are two kinds of key and they are not interchangeable:
+
+* the **default key** — the password in the ``HamDrawConfig`` node, or
+  ``HAMDRAW_PASSWORD``.  It is what every existing card and workflow already
+  holds, it keeps working unchanged, and it means *every* category.
+* the **key table** — ``chp_keys.json`` (see :mod:`hamdraw_chp.keys`), where a key
+  names the categories it may use.
+
+``/chp/info`` speaks each key's own subset of the tables, and the *execution*
+layer re-checks the category on every submit — because leaving something out of
+a document is a courtesy to a UI, not a permission (§3.3).
+
+**Nothing configured at all** (no default key and an empty table) leaves the
+deployment public and ``/chp/info`` answering ``200`` with everything, which is
+the behaviour that shipped before keys existed.  Leaving the password empty
+therefore still disables the check — until a key table entry exists, and
+``auth.required`` says which of the two states this is.
 
 Images are uploaded inline as base64 in the job body and are written into
 ``input/hamdraw/`` before the graph runs, so a built-in graph can reference
@@ -109,7 +133,6 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-import hmac
 import json
 import threading
 import time
@@ -121,6 +144,7 @@ from aiohttp import web
 from . import backends
 from . import capabilities as capabilities_module
 from . import families
+from . import keys as keys_module
 from . import settings as settings_module
 from . import translate as translate_module
 from .version import __version__
@@ -162,6 +186,7 @@ ERROR_STATUS = {
     "bad_mask": 400,
     "stretched_reference": 400,
     "invalid_workflow": 400,
+    "forbidden_capability": 403,
     "no_model": 409,
     "busy": 429,
     "duplicate_request": 409,
@@ -179,6 +204,7 @@ ERROR_MESSAGES = {
     "bad_mask": "局部重绘必须提供蒙版图。",
     "stretched_reference": "参考图的宽高比和这次任务的分辨率不一致：按分辨率缩放会把它压变形，而变形之后从成图上完全看不出来。请按任务分辨率合成参考图再提交。",
     "invalid_workflow": "内置工作流校验失败，可能是模型或节点缺失。",
+    "forbidden_capability": "这把 key 没有这个能力。",
     "no_model": "没有可用的模型，请先在 CHP 插件配置节点里选好这个场景要用的模型。",
     "busy": "队列已满，请稍后再试。",
     "duplicate_request": "这个 request_id 已经用过了：重发同一次提交请沿用同一个 request_id，换一份内容请换一个 request_id。",
@@ -202,8 +228,15 @@ def _json(payload: Any, status: int = 200) -> web.Response:
     return web.json_response(payload, status=status, dumps=lambda value: json.dumps(value, ensure_ascii=False))
 
 
-def _fail(code: str, message: str = "", *, status: int | None = None, detail: Any = None) -> web.Response:
-    payload: dict[str, Any] = {"error": code, "message": message or ERROR_MESSAGES.get(code, code)}
+def _fail(code: str, message: str = "", *, status: int | None = None, detail: Any = None,
+          spec: str | None = None) -> web.Response:
+    payload: dict[str, Any] = {"error": code}
+    if spec is not None:
+        # **只有 401 用它**（§1.1.1）。一个客户端本来会按「地址可能填错」去试两三个
+        # 候选路径；有了这一项，「是 CHP、只是钥匙不对」就成了一个确定的答案，而不是
+        # 靠猜 URL 猜出来的。其余错误码的响应形状一个字节都没变 —— 客户端是按形状解析的。
+        payload["spec"] = spec
+    payload["message"] = message or ERROR_MESSAGES.get(code, code)
     if detail is not None:
         payload["detail"] = detail
     return _json(payload, status or ERROR_STATUS.get(code, 400))
@@ -240,21 +273,79 @@ def _body_token(body: Any) -> str:
     return str(params.get("password") or "").strip()
 
 
-def _authorized(request: web.Request, body: Any = None) -> bool:
-    """The header first, then the body's ``chp_params.password``.
+def _keys_configured() -> bool:
+    """Is this deployment protected at all?  —— 也就是「对外」的那个开关。
 
-    Both carriers are accepted — the header is what a ``GET`` and a ``POST``
-    without a body *must* use, and what every client used before this version —
-    but the contract asks a client to send one, not both, so that "which one was
-    meant" never becomes a question.
+    两件事只要有一件成立就算配了钥匙：配置节点里那个密码非空，或 key 表非空。
+
+    **「一把都没配 ⇒ 公开」是今天的既有行为，不许被无声取消**：用户的工作流与卡片里
+    存的可能就是空密码（``hamdraw/README.md``：「密码留空则不校验」）。所以「没有 key
+    就等于什么都没有对外」（§3.3）这句**只在配了 key 之后**才成立 —— 这里就是那两个
+    前提的唯一出处。
     """
-    expected = _password()
-    if not expected:
-        return True
-    if hmac.compare_digest(_token_of(request), expected):
-        return True
-    token = _body_token(body)
-    return bool(token) and hmac.compare_digest(token, expected)
+    return bool(_password()) or bool(keys_module.read())
+
+
+def _open_record() -> dict[str, Any]:
+    """The sentinel for a deployment with nothing configured (``source: "open"``).
+
+    A record and not a boolean, because every caller downstream wants the same
+    shape: the document needs a category set, and the job path needs one to check
+    against.  ``["*"]`` here means exactly what it means in the key table.
+    """
+    return {"categories": [keys_module.ALL], "source": "open"}
+
+
+def _key_of(request: web.Request, body: Any = None) -> dict[str, Any] | None:
+    """Which key this request carried — its record, or ``None`` for a refusal.
+
+    Three steps, in this order, and the order carries the behaviour:
+
+    1. **nothing configured** ⇒ the open sentinel.  Checked *first* on purpose:
+       ``_authorized`` used to return ``True`` the moment the password was empty,
+       and moving that check after the table lookup would turn every legacy
+       empty-password deployment into a 401.
+    2. **the default key** — the config node's password and ``HAMDRAW_PASSWORD``,
+       still the same string users have in their cards and workflows.  Its
+       meaning is upgraded rather than replaced: full rights (``["*"]``).
+    3. **the table**, where a key may hold any subset of the categories.
+
+    Both carriers are tried at every step — the header first, then the body's
+    ``chp_params.password`` — because a ``GET`` has no body to put a secret in and
+    a ``POST`` must not have to put it in a URL or a log line.
+    """
+    entries = keys_module.read()
+    default = _password()
+    if not default and not entries:
+        return _open_record()
+
+    tokens = (_token_of(request), _body_token(body))
+    if default:
+        for token in tokens:
+            if token and keys_module.matches(token, default):
+                return {"categories": [keys_module.ALL], "source": "default"}
+    for token in tokens:
+        found = keys_module.resolve(token, entries)
+        if found is not None:
+            return {**found, "source": "table"}
+    return None
+
+
+def _authorized(request: web.Request, body: Any = None) -> bool:
+    """A thin wrapper over :func:`_key_of` — callers that only need a yes/no.
+
+    Kept because "did this request get in" is a different question from "which key
+    was it", and most call sites only ask the first.  The ones that need the
+    second (the document's filtering, the execution-layer check) ask
+    :func:`_key_of` directly — a boolean cannot answer them.
+    """
+    return _key_of(request, body) is not None
+
+
+def _unauthorized() -> web.Response:
+    """The one 401, from the one place — including the ``spec`` that marks it CHP."""
+    return _fail("unauthorized", spec=capabilities_module.SPEC)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -542,17 +633,29 @@ def _progress_payload(job_id: str, job: dict[str, Any] | None, entry: dict[str, 
 # --------------------------------------------------------------------------- #
 
 async def info(request: web.Request) -> web.Response:
-    """``GET /chp/info`` — the whole contract, and deliberately public.
+    """``GET /chp/info`` — the contract, as far as this key may see it.
 
-    A wrong password is not an error here: ``auth.authorized`` says which it was,
-    which is what lets one call answer "is the address right" and "is the
-    password right" at the same time.
+    Needs a key once one is configured, and answers that key's own subset of the
+    tables.  A refusal is the one ``401`` that carries ``spec``: it is the single
+    call a client makes before it knows anything, so it is the one place where
+    "this is CHP, the key is wrong" has to be unmistakable — the next thing the
+    user is asked to do is completely different from what a wrong *address* asks
+    for.
+
+    ``auth_required`` is the deployment-wide fact (is anything configured), while
+    ``authorized`` is this request's — always true here, since anything else
+    returned above.  The field stays because removing it would break clients
+    that read it; its meaning is now "this server wants a key, and yours worked".
     """
+    record = _key_of(request)
+    if record is None:
+        return _unauthorized()
     return _json(
         capabilities_module.document(
             files_of=_abilities_of,
-            authorized=_authorized(request),
-            auth_required=bool(_password()),
+            allowed=keys_module.allowed_of(record),
+            authorized=True,
+            auth_required=_keys_configured(),
             translation=translate_module.describe(),
             auth_hint=AUTH_HINT,
             errors=sorted(ERROR_STATUS),
@@ -599,19 +702,22 @@ def _resolve_models(category: str) -> tuple[dict[str, str], web.Response | None]
 
 
 async def create_job(request: web.Request) -> web.Response:
-    # The body is read *before* the password is checked, because the password may
-    # be in it: a request that carries a body sends ``chp_params.password``, and
-    # a secret belongs in neither a URL nor a log line.  Reading it first costs
-    # nothing — a successful request needed the body anyway, and aiohttp already
-    # bounds it at ``MAX_BODY_BYTES``.
+    # The body is read *before* the key is checked, because the key may be in it:
+    # a request that carries a body sends ``chp_params.password``, and a secret
+    # belongs in neither a URL nor a log line.  Reading it first costs nothing —
+    # a successful request needed the body anyway, and aiohttp already bounds it
+    # at ``MAX_BODY_BYTES``.
     try:
         body = await request.json()
     except Exception:
         return _fail("bad_request")
     if not isinstance(body, dict):
         return _fail("bad_request")
-    if not _authorized(request, body):
-        return _fail("unauthorized")
+    # The *record*, not a boolean: this request's category still has to be checked
+    # against this key's set, further down (the execution layer, §3.3).
+    record = _key_of(request, body)
+    if record is None:
+        return _unauthorized()
 
     # The optional idempotency key.  A client that retries a submit it never got an
     # answer to — the host timed out at 180 s, the phone changed networks, the app
@@ -653,6 +759,15 @@ async def create_job(request: web.Request) -> web.Response:
             return _fail("unsupported_category",
                          detail={"category": body.get("category"), "ignored": ignored})
         name = str(category["category"])
+
+        # 执行层（§3.3 第二层，承重）。**播报层少列几项不是权限**：知道 category
+        # 名字的人可以绕过界面直接 POST，所以「看不到」是障眼法，「拒收」才是权限。
+        # 它排在必填项检查之前：先说「你不可以」，再说「你的请求写错了」—— 反过来的话
+        # 一个没有权限的调用者能从报错里把字段规则一条条问出来。
+        if not keys_module.permits(record, name):
+            return _fail("forbidden_capability",
+                         detail={"category": name, "key": keys_module.label_of(record),
+                                 "ignored": ignored})
 
         # 2026-10-01 起, 画幅与种子是**必填**的: 一个是"这次要多大", 一个是"可不可以
         # 重来", 两件都是客户端唯一说得准的事（其余旋钮都属于部署侧）。缺了就说缺了,
@@ -792,7 +907,7 @@ async def create_job(request: web.Request) -> web.Response:
 
 async def job_status(request: web.Request) -> web.Response:
     if not _authorized(request):
-        return _fail("unauthorized")
+        return _unauthorized()
     job_id = str(request.match_info.get("job_id") or "").strip()
     job = _tracked(job_id)
     entry = backend.history(job_id)
@@ -817,7 +932,7 @@ async def job_progress(request: web.Request) -> web.Response:
     a number would be worse than admitting there is none.
     """
     if not _authorized(request):
-        return _fail("unauthorized")
+        return _unauthorized()
     job_id = str(request.match_info.get("job_id") or "").strip()
     job = _tracked(job_id)
     entry = backend.history(job_id)
@@ -829,7 +944,7 @@ async def job_progress(request: web.Request) -> web.Response:
 
 async def job_output(request: web.Request) -> web.Response:
     if not _authorized(request):
-        return _fail("unauthorized")
+        return _unauthorized()
     job_id = str(request.match_info.get("job_id") or "").strip()
     try:
         index = int(str(request.match_info.get("index") or "0"))
@@ -850,7 +965,7 @@ async def job_output(request: web.Request) -> web.Response:
 
 async def cancel_job(request: web.Request) -> web.Response:
     if not _authorized(request):
-        return _fail("unauthorized")
+        return _unauthorized()
     job_id = str(request.match_info.get("job_id") or "").strip()
     job = _tracked(job_id)
     running, pending = backend.queue()
@@ -883,7 +998,7 @@ async def translate_prompts(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return _fail("bad_request")
     if not _authorized(request, body):
-        return _fail("unauthorized")
+        return _unauthorized()
     raw = body.get("texts")
     if isinstance(raw, str):
         raw = [raw]

@@ -22,6 +22,7 @@ QWEN = "hamdraw_chp/families/qwen_image.py"
 #: S1 之后「输出地址由谁拼」这条判据住在后端里 —— 变异必须跟着它走，否则锚点
 #: 找不到就静默 SKIP，而 SKIP 与 CAUGHT 在退出码上看不出区别。
 INPROC = "hamdraw_chp/backends/comfy_inproc.py"
+KEYS = "hamdraw_chp/keys.py"
 
 #: 变异会把某一处改坏, 而"改坏"的一种样子就是让某条路径变成死等。没有上限的话
 #: 一次死等就把整个脚本拖住, 读的人分不清"它在跑"和"它卡住了"。
@@ -267,11 +268,12 @@ MUTATIONS = [
         "chp_params 的未知键不许影响鉴权",
     ),
     (
+        # S2 重写了这段，锚点跟着换：原来那两条语句现在住在 _key_of 里。
         "密码只读头部，不读字段",
         SERVER,
-        '    token = _body_token(body)\n    return bool(token) and hmac.compare_digest(token, expected)',
-        '    return False',
-        "chp_params.password 必须能过鉴权",
+        '    tokens = (_token_of(request), _body_token(body))',
+        '    tokens = (_token_of(request), "")',
+        "默认 key 从字段里来也算数",
     ),
     (
         "小数的 step 又被静默取整",
@@ -398,11 +400,110 @@ MUTATIONS = [
         'import folder_paths  # mutation probe\nfrom . import backends\n',
         "server.py 里不该再出现 folder_paths",
     ),
+    # --- S2 · key 两态 + 两层授权（计划 §3.2.1 / §3.3） ------------------- #
+    # 前两条方向相反, 两条都要在 —— 把公开态当成漏掉的一支、或把老用户的空密码部署
+    # 判死, 是这件事最容易出的两种错, 而它们在一条断言里只有一种是红的。
+    (
+        "一把 key 都没配也不再免检（老用户的空密码部署被判死）",
+        SERVER,
+        '    if not default and not entries:\n        return _open_record()\n',
+        '    if False:\n        return _open_record()\n',
+        "一把 key 都没配时 /chp/info 要 200",
+    ),
+    (
+        "配了 key 之后 info 又改回「未授权也回答」",
+        SERVER,
+        '    record = _key_of(request)\n    if record is None:\n        return _unauthorized()\n',
+        '    record = _key_of(request) or _open_record()\n',
+        "配了 key 之后无 key 要 401",
+    ),
+    (
+        "401 不再自证是 CHP（去掉 spec）",
+        SERVER,
+        '    return _fail("unauthorized", spec=capabilities_module.SPEC)',
+        '    return _fail("unauthorized")',
+        "401 要带 spec 自证是 CHP",
+    ),
+    (
+        "别的错误码也带上 spec（响应形状被改）",
+        SERVER,
+        '    if spec is not None:\n',
+        '    if True:\n',
+        "别的错误码不许带 spec",
+    ),
+    # 「播报层过滤」要两边一起少。**分开两条变异**: 只过滤一边正是最常见的漏法,
+    # 而两种漏法的表现不同（多一条规则 / 多一条能力）—— 一条变异证伪不了另一条。
+    (
+        "按 key 过滤时只记得 abilities（rules 仍全给）",
+        CAPABILITIES,
+        '        "rules": rules(allowed),',
+        '        "rules": rules(),',
+        "只授权 fast ⇒ rules 只剩它",
+    ),
+    (
+        "按 key 过滤时只记得 rules（abilities 仍全给）",
+        CAPABILITIES,
+        '    for category in _allowed_categories(allowed):',
+        '    for category in _allowed_categories(None):',
+        "abilities 必须与 rules 同步少",
+    ),
+    (
+        "空授权集被当成「全部」（撤权变成授权）",
+        KEYS,
+        '    if ALL in names:\n        return None\n    return set(names)',
+        '    if ALL in names or not names:\n        return None\n    return set(names)',
+        "空授权集不等于「全部」",
+    ),
+    (
+        "执行层不校验 category（只靠界面藏起来）",
+        SERVER,
+        '        if not keys_module.permits(record, name):',
+        '        if False:',
+        "未授权的 category 要 403",
+    ),
+    (
+        "默认 key 也走 key 表查找（配置节点那个密码失效）",
+        SERVER,
+        '    if default:\n        for token in tokens:\n',
+        '    if False:\n        for token in tokens:\n',
+        "默认 key 要能过门",
+    ),
+    # --- 非 ASCII 取值（中文密码 / 中文 key） ------------------------------ #
+    (
+        # compare_digest 只吃 ASCII 的 str，喂它一个含中文的 str 直接抛 TypeError。
+        # 后果不是拒收，是**整条请求 500** —— 实测过：中文密码打进来，
+        # 默认 key 与 key 表两条路都炸。两处比对各留一条变异。
+        "中文 key 退回 str 比对（含非 ASCII 就抛异常，不是拒绝）",
+        KEYS,
+        'return hmac.compare_digest(token.encode("utf-8"), key.encode("utf-8"))',
+        'return hmac.compare_digest(token, key)',
+        "key 表里那把中文 key 要能进门",
+    ),
+    (
+        "中文默认密码退回 str 比对（配置节点那个密码被打成 500）",
+        SERVER,
+        '            if token and keys_module.matches(token, default):',
+        '            import hmac as _hmac\n            if token and _hmac.compare_digest(token, default):',
+        "中文默认密码也要能进门",
+    ),
 ]
 
 originals = {}
 for _, file, _, _, _ in MUTATIONS:
     originals.setdefault(file, (ROOT / file).read_text(encoding="utf-8"))
+
+#: 动手之前先把**所有**锚点对一遍。对不上的一条会静默 SKIP，而 SKIP 会把后面几十条
+#: 变成一张长长的"没抓住"清单 —— 真正的原因反而埋在最上面。实测踩过一次：
+#: `known = None` 作为上一次运行的残留留在 ``server.py`` 里（那次进程被 SIGKILL，
+#: 恢复代码根本没机会跑），幂等测试必红，于是它之后的所有断言都报"没抓住"，
+#: 看起来像"新加的东西全没守住"。宁可在改坏任何东西之前就喊停。
+_stale = [name for name, file, find, _, _ in MUTATIONS if find not in originals[file]]
+if _stale:
+    print("锚点对不上，一条变异都没跑 —— 先看这几处是不是被改过、挪走了，")
+    print("或者源文件里还留着上一次没还原的变异：")
+    for _name in _stale:
+        print("  " + _name)
+    sys.exit(3)
 
 
 def restore_originals() -> None:

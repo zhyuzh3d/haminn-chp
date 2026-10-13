@@ -38,7 +38,9 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
    返回 JSON，且 `spec` 为 `chp/2`、`plugin.version` 是你期望的那一版（当前 **3.1.1**）、每个能力的 `ready` 为 `true`，即成功。
 
-   信息端点**密码填错也照答**（此时 `auth.authorized` 为 `false`），所以“地址对不对”和“密码对不对”可以一次问清：能返回 JSON 说明地址通，`authorized` 说明密码。
+   信息端点**也要钥匙**（前提是配了至少一把）。没带或带错 ⇒ `401`，而那个响应体里多一个 `spec` —— 它自证“这里是 CHP，只是钥匙不对”，客户端因此不必靠猜 URL 去分辨“地址填错了”和“钥匙不对”。这两种情况给用户的下一步动作完全不同。
+
+   **一把钥匙都没配时（配置节点的密码为空、且没有 key 表）服务是公开的**，`/chp/info` 照旧 `200` 并给出全部能力 —— 这是既有行为，老用户零改动。
 
    **插件版本只有一个出处**：`hamdraw_chp/version.py` 的 `__version__`。发布包名（`tools/package-plugin.py`）与 App 内嵌副本（`tools/embed-plugin.py`）都读它，不会各自漂移。
 
@@ -46,7 +48,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 | 字段 | 说明 |
 |---|---|
-| `password` | **访问密码**。填了就只有带对密码的请求能出图；**留空 = 不校验**。 |
+| `password` | **访问密码**，也是**默认钥匙**：填了就只有带对它的请求能用；**留空 = 不校验**（前提是也没有 key 表 —— 见下）。它的权限是全部场景。 |
 | `fast_checkpoint` | 快速生图用的模型，默认 `DreamShaper8_LCM.safetensors` |
 | `inpaint_checkpoint` | 局部重绘用的模型，可填 `(same as fast)` 复用上一个 |
 | `upscale_checkpoint` | 图像放大用的模型，同样支持 `(same as fast)` |
@@ -84,7 +86,9 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 `HAMDRAW_*` 环境变量、`hamdraw_settings.json`、`hamdraw-comfy-settings/v1` 这些**盘上数据的格式标识故意没跟着协议改名** —— 它们是格式标识，不是产品名，改名只会让每台机器都要重新配一遍。
 
-**密码错了会怎样**：请求在**入队之前**就被拦下，返回 `401 unauthorized`，**不会生图**。客户端拿到的是一句可读的中文提示，而不是一张画错的图。
+**钥匙不对会怎样**：请求在**入队之前**就被拦下，返回 `401 unauthorized`，**不会生图**。客户端拿到的是一句可读的中文提示，而不是一张画错的图。
+
+**钥匙不够会怎样**：如果这台机器配了**按场景授权**的 key（`chp_keys.json`），而请求的 `category` 不在这把 key 的授权集里，返回 `403 forbidden_capability`。这道判定在**执行层**、每次提交都做一遍 —— 信息文档里少列几项只是为了让界面不出现点不动的选项，**它不是权限**：知道 `category` 名字的人可以直接 POST。
 
 ## 五个场景（`category`）
 
@@ -154,8 +158,8 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 | 键 | 值 | 鉴权 | 说明 |
 |---|---|---|---|
-| `info` | `GET /chp/info` | **公开** | 信息文档：规则表 + 能力表 + 两份请求 schema + 翻译可用性 + 错误码。密码错了也照答，由 `auth.authorized` 说明 |
-| `jobs` | `POST /chp/jobs` | 见下 | 提交作业 → **202** `{"job": {…}}` |
+| `info` | `GET /chp/info` | **钥匙**（前提见上） | 信息文档：规则表 + 能力表 + 两份请求 schema + 翻译可用性 + 错误码。**只播报这把钥匙能用的那部分**；无钥匙/错钥匙 ⇒ `401`（响应体带 `spec`）。一把都没配时公开 |
+| `jobs` | `POST /chp/jobs` | 见下 | 提交作业 → **202** `{"job": {…}}`。**执行层再校验 `category`**，不在钥匙授权集里 ⇒ `403 forbidden_capability` |
 | `job` | `GET /chp/jobs/{job_id}` | Bearer | 状态 + 提示词 + `outputs`（较重，完成后再调） |
 | `progress` | `GET /chp/jobs/{job_id}/progress` | Bearer | **高频轮询用**：只回 `{id, state, queue_position, progress}`，不解析结果 |
 | `output` | `GET /chp/jobs/{job_id}/output/{index}` | Bearer | 取成图（直接返回 PNG） |
@@ -164,14 +168,33 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 **`progress` 允许为 `null`，而且经常就是 `null`。** 编一个假百分比比给 `null` 更糟；`queue_position`（前面还有几个作业，自己在跑时为 0）是任何实现都算得出来的可靠数字，客户端用不确定态 + 队列位置就够了。
 
-### 密码放在哪：一个请求只用一种载体
+### 钥匙放在哪：一个请求只用一种载体
 
 | 请求 | 载体 |
 |---|---|
 | **带 body 的 `POST`**（提交任务、翻译） | `chp_params.password` |
-| `GET` 与**无 body 的 `POST`**（轮询、取状态、取图、取消） | `Authorization: Bearer <password>` —— **唯一例外，理由是密码不进 URL 也不进日志** |
+| `GET` 与**无 body 的 `POST`**（轮询、取状态、取图、取消） | `Authorization: Bearer <key>` —— **唯一例外，理由是钥匙不进 URL 也不进日志** |
 
-参考实现**继续也接受** `Basic` 与 `X-HamDraw-Password`（今天三个都认），所以这条规矩是“新写的按字段、拿不到 body 时才用头”，不是把老路堵死。密码为空时不需要。
+参考实现**继续也接受** `Basic` 与 `X-HamDraw-Password`（今天三个都认），所以这条规矩是“新写的按字段、拿不到 body 时才用头”，不是把老路堵死。一把钥匙都没配时不需要。
+
+### 两种钥匙
+
+| 钥匙 | 从哪来 | 权限 |
+|---|---|---|
+| **默认钥匙** | 配置节点里的 `password`，或环境变量 `HAMDRAW_PASSWORD`。老客户端手里就是这个。 | 全部场景 |
+| **key 表** | 包目录里的 `chp_keys.json`（**与本文件同级**，不在版本库里，权限 0600）。每把 key 写它自己的 `categories`，`["*"]` 表示全部 | 就是它写的那些 |
+
+```json
+{ "schema": "chp-keys/v1",
+  "keys": [ { "id": "k_…", "label": "A1X 上的 Chataxi", "key": "…",
+              "categories": ["fast", "inpaint"], "created": "2026-10-13T00:00:00+08:00" } ] }
+```
+
+改完**下一个请求就生效**（每次请求重读），不用重启。`categories` 写成空数组是一把**什么都看不见、也什么都做不了**的钥匙 —— 那正是"撤权但先不删"的写法，而不是"全部"。
+
+**密码和 key 用什么字符都行，含中文** —— 比对按 UTF-8 字节做。这条有来由：`hmac.compare_digest` 喂它一个含非 ASCII 的 `str` 会直接抛异常，而"密码里有个「中」字"对运维是再普通不过的一件事 —— 坏起来不是拒收，是**整条请求 500**。
+
+## 五个场景（`category`）
 
 ### 两个扩展通道
 
@@ -179,7 +202,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 |---|---|---|
 | 层 | **模型层**（这次画什么） | **CHP 层**（这次怎么连、怎么算账） |
 | 住户 | **规范一个都不定义** | CHP 定义：目前只有 `password` |
-| 谁校验 | 没有人。**原样携带、原样回显** | 参考实现校验 `password` |
+| 谁校验 | 没有人。**原样携带、原样回显** | 参考实现拿它当**默认钥匙**比对。另一份是包目录里的 `chp_keys.json`（key 表），**不走这个通道、也不走 URL** —— 两者只要有一个对上就放行 |
 
 **`ext_params` 里没有官方字段表**：放什么进来都由你自己的客户端自己读，插件不筛不校验，`job.ext_params` 原样带回你发的那个对象（含嵌套结构）。
 
@@ -199,7 +222,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 | `ref_strength` | 规则参数 | 0.05–0.95，越界**夹到边界**并在 `job` 回显。只跟参考图一起发 —— 它是"要多像这张参考图"，没有图的时候没有意义 |
 | `image_base64` / `mask_base64` | 规则参数 | 参考图 / 蒙版（**白 = 要重画**）。图片可直接给 data URL，插件自己解码；请求体上限 32 MB。**规则签名里没有 `ref` 的类别（`generate`）收到 `image_base64` 会被拒**（`400 bad_image`）—— 这是"想画一张没有参考图的图"走错场景时唯一的当场信号 |
 | `ext_params` | 扩展通道 | 任意 JSON 对象 |
-| `chp_params` | 扩展通道 | 目前只有 `password` |
+| `chp_params` | 扩展通道 | 目前只有 `password`（也就是**默认钥匙**） |
 | `request_id` | 提交身份，可省 | 你自己这次提交的编号。**重发同一次提交就沿用同一个值**，服务端还你原来那个作业、不会再排一个；内容变了就换一个值。见下节 |
 
 **其余顶层字段一律忽略，并把名字回显到 `job.ignored`。** 这条回执不是可选项：没有它，一次参数改名对客户端就是**静默失效**。`capability` / `task` / `size` / `steps` / `negative_prompt` 这五个 v1 的顶层字段现在都不认了 —— 客户端漏改时会当场在 `ignored` 里看到自己发错的那个名字（甚至没带 `category` 时那份 `400` 的 `detail` 里也带着这份名单）。
@@ -237,7 +260,7 @@ CHP 是 **ComfyUI Haminn Protocol**；这个目录是它的**参考实现**，�
 
 `job` 对象里三个字段回答“提示词到底发生了什么”：`prompt_source` 是客户端给的原文、`prompt` 是实际送进模型的那份、`translated` 表示两者是否不同。
 
-错误码：`unauthorized(401)` / `bad_request` / `unsupported_category` / `unsupported_size` / `unsupported_steps` / `bad_image` / `bad_mask` / `stretched_reference` / `invalid_workflow` / `no_model(409)` / `busy(429)` / `duplicate_request(409)` / `not_found(404)` / `internal(500)`，全部带可读中文文案。`/chp/info` 的 `errors` 就是这份清单，所以客户端不必自己抄一遍。
+错误码：`unauthorized(401)` / `bad_request` / `unsupported_category` / `unsupported_size` / `unsupported_steps` / `bad_image` / `bad_mask` / `stretched_reference` / `invalid_workflow` / `forbidden_capability(403)` / `no_model(409)` / `busy(429)` / `duplicate_request(409)` / `not_found(404)` / `internal(500)`，全部带可读中文文案。`/chp/info` 的 `errors` 就是这份清单，所以客户端不必自己抄一遍。**其中只有 `unauthorized` 的响应体多一个 `spec`**（客户端靠它把「是 CHP、只是钥匙不对」和「那里没有插件」分开），其余错误码的形状一个字节都没变。
 
 ### `/cvp` 与 `/hamdraw/v1` 都不存在了
 

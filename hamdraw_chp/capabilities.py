@@ -577,8 +577,22 @@ def rule_entry(category: str) -> dict[str, Any]:
     }
 
 
-def rules() -> list[dict[str, Any]]:
-    return [rule_entry(category) for category in CATEGORY_TABLE]
+def _allowed_categories(allowed: set[str] | None) -> list[str]:
+    """Which categories to speak about, in table order.
+
+    ``None`` means "no filtering" and is the only spelling of it — an empty set
+    must stay an empty set, because "this key may do nothing" is a real answer
+    (it is how a key is revoked without being deleted) and it is the opposite of
+    "this deployment is open".  Keeping the two apart here is why the caller
+    translates ``["*"]`` into ``None`` rather than into "everything".
+    """
+    if allowed is None:
+        return list(CATEGORY_TABLE)
+    return [category for category in CATEGORY_TABLE if category in allowed]
+
+
+def rules(allowed: set[str] | None = None) -> list[dict[str, Any]]:
+    return [rule_entry(category) for category in _allowed_categories(allowed)]
 
 
 def _resolved_of(resolved: Any) -> dict[str, Any]:
@@ -591,7 +605,7 @@ def _resolved_of(resolved: Any) -> dict[str, Any]:
     return {"files": files, "ready": bool(resolved.get("ready")), "missing": missing}
 
 
-def abilities(files_of: Callable[[str], Any]) -> list[dict[str, Any]]:
+def abilities(files_of: Callable[[str], Any], allowed: set[str] | None = None) -> list[dict[str, Any]]:
     """The model-file groups that can actually answer, and what each can make.
 
     Grouped by *the files it runs on* — ``fast`` / ``inpaint`` / ``upscale`` are
@@ -608,9 +622,15 @@ def abilities(files_of: Callable[[str], Any]) -> list[dict[str, Any]]:
 
     Order is preserved from the category table, so ``abilities[0]`` is the one
     holding the first category's frames.
+
+    ``allowed`` filters **before grouping**, not after: dropping a category after
+    its frames were merged into a group would leave a ``frames`` list still
+    advertising a canvas the caller may not ask for.  ``None`` keeps every
+    category, and that path is exactly what this function did before filtering
+    existed.
     """
     groups: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
-    for category in CATEGORY_TABLE:
+    for category in _allowed_categories(allowed):
         resolved = _resolved_of(files_of(category))
         key = (family_of(category), tuple(sorted(resolved["files"].items())))
         group = groups.get(key)
@@ -632,13 +652,41 @@ def abilities(files_of: Callable[[str], Any]) -> list[dict[str, Any]]:
     return list(groups.values())
 
 
-def document(*, files_of: Callable[[str], Any], authorized: bool, auth_required: bool,
-             translation: dict[str, Any], auth_hint: str = "", errors: list[str] | None = None) -> dict[str, Any]:
-    """The whole discovery document.
+def input_schemas(allowed: set[str] | None = None) -> dict[str, dict[str, Any]]:
+    """The shared input schemas this caller can actually reach.
 
-    Answers even when the password is wrong: ``auth.authorized`` says which it
-    was, which is what lets a client tell "the address is right, the password is
-    not" out of the one call it was going to make anyway.
+    Filtered by the **rules still in play**, not by category: one schema serves
+    every category that uses its rule, so a key allowed only ``fast`` must still
+    be handed the ``txt-ref-2-img`` schema it needs to build a request, while not
+    being told about the mask one.  Filtering per category would either drop a
+    schema that is still needed or keep one for a rule nobody may use.
+
+    ``None`` returns every schema, which is what the document did before keys
+    existed.
+    """
+    if allowed is None:
+        return deepcopy(INPUT_SCHEMAS)
+    wanted = {input_of(str(CATEGORY_TABLE[category]["rule"]))
+              for category in _allowed_categories(allowed)}
+    return {key: deepcopy(value) for key, value in INPUT_SCHEMAS.items() if key in wanted}
+
+
+def document(*, files_of: Callable[[str], Any], authorized: bool, auth_required: bool,
+             translation: dict[str, Any], allowed: set[str] | None = None,
+             auth_hint: str = "", errors: list[str] | None = None) -> dict[str, Any]:
+    """The whole discovery document, as one key is allowed to see it.
+
+    ``allowed`` is that key's category set (``None`` = no filtering).  Every table
+    that names categories — ``rules`` / ``abilities`` / ``input_schemas`` — is
+    filtered together, and they must stay together: a client matches its slots on
+    ``signature``, so a rule left in the document without a matching ability (or
+    the reverse) shows the user an option that cannot be submitted.  That is the
+    same reason ``abilities`` derives its grouping instead of declaring it.
+
+    »**播报过滤不是权限。**« What this function leaves out is only what a client
+    is told about; anyone who knows a category name can still POST it.  The
+    refusal lives in ``server.py``'s category check (§3.3 第二层), and this
+    module cannot enforce it from here — it never sees a request.
 
     ``translation`` and ``files_of`` are supplied by the caller rather than read
     here: this module is the specification, and it must not depend on the parts
@@ -655,9 +703,9 @@ def document(*, files_of: Callable[[str], Any], authorized: bool, auth_required:
             "hint": auth_hint or "密码在 ComfyUI 的 CHP 插件配置节点里设置。",
         },
         "endpoints": dict(ENDPOINTS),
-        "rules": rules(),
-        "abilities": abilities(files_of),
-        "input_schemas": deepcopy(INPUT_SCHEMAS),
+        "rules": rules(allowed),
+        "abilities": abilities(files_of, allowed),
+        "input_schemas": input_schemas(allowed),
         "translation": deepcopy(translation or {}),
     }
     if errors:
@@ -674,6 +722,6 @@ __all__ = [
     "accepts_image", "categories", "category_of", "check_frames",
     "clamp_ref_strength", "clean_defaults", "default_ref_strength",
     "default_resolution", "document", "family_of", "frames_of", "has_reference",
-    "input_of", "needs_image", "resolution_size", "rule_entry", "rules",
+    "input_of", "input_schemas", "needs_image", "resolution_size", "rule_entry", "rules",
     "signature_of", "validate_resolution", "validate_step",
 ]
