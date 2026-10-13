@@ -964,7 +964,10 @@ ComfyUI and puts that machine's local models behind one interface. Get it from t
    `plugin.label` 已是新名（`CHP 插件（CHPCP）`）。
 2. **授权两态**（顺序不能颠倒 —— 先确认公开态，再装 key 验 401）：
    - **一台都没配 key 时**：`GET /chp/info` **不带 key** ⇒ **200**、`auth.required: false`、能力全在
-     （这是 A1X 上的现状，也正是「老用户零改动」的直接证据，§3.2.1）；
+     （这是「老用户零改动」的直接证据，§3.2.1）。
+     ⚠ **2026-10-13 实测：A1X 不是这一态**（`hamdraw_settings.json` 里配了 `password` ⇒ 今天
+     `auth.required` 就已经是 `true`）⇒ 这一条**在这台机器上不可达**，不能靠真机证。
+     它由 `test_spec.py` 的两条离线用例守着（§3.2.1 那两条必须同时绿），真机只能证下面两条；
    - 再放一把 key 进 `chp_keys.json`（**在设备上手工放，别让工具代填**）⇒ **不带 key** ⇒ `401` 且响应体带 `spec`；
    - **带一把只授权 `speak` 的 key** ⇒ 文档里只有语音那一节（`rules` 与 `abilities` 同时少），
      且用这把 key 打 `/chp/jobs` ⇒ **403 `forbidden_capability`**。
@@ -974,6 +977,14 @@ ComfyUI and puts that machine's local models behind one interface. Get it from t
 5. **整包**：同一次请求改成 `stream:false` ⇒ `Content-Type: audio/wav`，body 以 `RIFF` 开头。
 6. **九个音色逐个**跑一遍，全部 2xx 且字节数非零（这是「能不能获得它的音色」的直接答案）。
 7. **没有旁效**：同一把全权 key 下，`rules` / `abilities` 与图片侧**逐项与升级前一致**（加法不许碰旧的两表）。
+
+> **2026-10-14 实测：①–⑦ 全部通过**（`hamdraw_chp/` 21 个文件传到 A1X、两侧 sha256 逐一相同、
+> 重启 `minimax-h3-comfy`；逐条数字 ⇒ 当日日志）。两处做法与本节写法不同，都以实测为准：
+> **第 7 条**没有拿"升级前那份 `/chp/info`"比（它已经被覆盖了），而是用部署前的备份（3.1.1 源码）
+> 与本机 3.2.0 **逐项比对** `RULES` / `FRAMES` / `CATEGORY_TABLE` / `INPUT_SCHEMAS` /
+> `abilities(...)` / `categories()` —— 同一台机器、同一份设置，**六项全 IDENTICAL**，比字符串比对硬；
+> **引擎地址与令牌没有留在设备上**（验收时临时写入、验完按 sha256 原样还原）：它是部署决定，
+> 由业主填一次，`speech.url` 见 §6.1。第 2 条的第一支在这台机器上不可达（见上）。
 
 > **注（必读）**：真机上要让 Chataxi 出声，需要**业主自己在朗读槽配一张 CHP 卡并保存 key**。
 > 那张卡是他的数据；按既有规矩（`AGENTS.md`：密钥只在用户明确保存后写入），
